@@ -38,7 +38,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from korz_core import KorzLibrary, KorzConfig, SearchResult
+from korz_core import KorzLibrary, KorzConfig, SearchResult, ShadowRunner
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +49,7 @@ logger = logging.getLogger("korz_bot")
 
 dp = Dispatcher()
 lib: Optional[KorzLibrary] = None
+shadow_runner: Optional[ShadowRunner] = None
 ALLOWED_USERS: Set[int] = set()
 
 MAX_QUERY_LENGTH = 500
@@ -330,8 +331,20 @@ async def handle_query(message: types.Message):
         return
 
     try:
-        # Canonical search via korz_core.search (read-only)
-        results = lib.search(query, mode="auto", limit=3)
+        # Canonical search via korz_core.search (read-only, shadow handled explicitly async)
+        t0 = time.perf_counter()
+        results = lib.search(query, mode="auto", limit=3, shadow=False)
+        latency_fts = (time.perf_counter() - t0) * 1000
+
+        # Non-blocking background shadow evaluation (never delays user response)
+        if lib.config.shadow_enabled and shadow_runner:
+            asyncio.create_task(
+                shadow_runner.evaluate_async(
+                    query=query,
+                    fts_results=results,
+                    latency_fts_ms=latency_fts,
+                )
+            )
 
         if not results:
             clean_q = html.escape(query)
@@ -368,12 +381,33 @@ async def handle_query(message: types.Message):
                         InlineKeyboardButton(
                             text="📖 Контекст (±2 абз.)",
                             callback_data=f"ctx:{r.paragraph_id}:2",
-                        )
+                        ),
+                        InlineKeyboardButton(
+                            text="🎯 Саме цей",
+                            callback_data=f"fb:tgt:{r.paragraph_id}",
+                        ),
                     ]
                 ]
             )
 
             await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        # Rating prompt for evaluation telemetry
+        fb_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="👍 Знайшов",
+                        callback_data=f"fb:up:{results[0].paragraph_id if results else 0}",
+                    ),
+                    InlineKeyboardButton(
+                        text="👎 Не те",
+                        callback_data="fb:dn:0",
+                    ),
+                ]
+            ]
+        )
+        await message.answer("💡 <i>Оцініть точність пошуку:</i>", reply_markup=fb_kb, parse_mode=ParseMode.HTML)
 
     except Exception as e:
         logger.exception(f"Error handling search query: '{query}'")
@@ -383,8 +417,49 @@ async def handle_query(message: types.Message):
         )
 
 
+@dp.callback_query(F.data.startswith("fb:"))
+async def cb_feedback(callback: types.CallbackQuery):
+    if not await check_auth_or_reject(callback):
+        return
+
+    try:
+        parts = callback.data.split(":")
+        fb_type = parts[1]  # 'tgt', 'up', 'dn'
+        target_pid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        if target_pid == 0:
+            target_pid = None
+
+        query_text = ""
+        if callback.message and callback.message.reply_to_message and callback.message.reply_to_message.text:
+            query_text = callback.message.reply_to_message.text.strip()
+
+        user_str = str(callback.from_user.id)
+        type_map = {"tgt": "target", "up": "found", "dn": "not_relevant"}
+        canonical_type = type_map.get(fb_type, "found")
+
+        if lib:
+            lib.record_feedback(
+                query=query_text or "telegram_query",
+                feedback_type=canonical_type,
+                target_paragraph_id=target_pid,
+                user_id=user_str,
+            )
+
+        if fb_type == "tgt":
+            toast = "Дякуємо! Фрагмент позначено як цільовий 🎯"
+        elif fb_type == "up":
+            toast = "Дякуємо за оцінку! 👍"
+        else:
+            toast = "Дякуємо! Врахуємо для покращення ✍️"
+
+        await callback.answer(toast, show_alert=False)
+    except Exception as e:
+        logger.exception(f"Error handling feedback callback: {callback.data}")
+        await callback.answer("Відгук збережено", show_alert=False)
+
+
 async def main():
-    global lib, ALLOWED_USERS
+    global lib, shadow_runner, ALLOWED_USERS
 
     parser = argparse.ArgumentParser(description="KORZ Telegram Bot Adapter (v1.1 Hardened)")
     parser.add_argument("--token", help="Telegram Bot Token")
@@ -410,6 +485,10 @@ async def main():
         logger.warning("⚠️ УВАГА: Allowlist порожній! Бот доступний для всіх. Встановіть ALLOWED_TELEGRAM_USERS для захисту.")
 
     lib = KorzLibrary()
+    shadow_runner = ShadowRunner(lib, max_concurrency=1)
+    if lib.config.shadow_enabled:
+        logger.info("👻 Shadow Mode активовано: фоновий збір та аналітика семантичного пошуку")
+
     bot = Bot(token=token)
 
     try:

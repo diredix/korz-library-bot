@@ -15,6 +15,7 @@ Everything operates within a local SQLite database:
   - Hot backup & restore APIs
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -55,6 +56,10 @@ class KorzConfig:
     semantic_enabled: bool = field(
         default_factory=lambda: os.environ.get("KORZ_SEMANTIC_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     )
+    shadow_enabled: bool = field(
+        default_factory=lambda: os.environ.get("KORZ_SHADOW_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    )
+    fts_engine_version: str = "sqlite-fts5-bm25-v1.1"
 
     @classmethod
     def from_env(cls) -> "KorzConfig":
@@ -63,12 +68,14 @@ class KorzConfig:
         sources_dir = data_dir / "sources"
         backups_dir = data_dir / "backups"
         semantic_enabled = os.environ.get("KORZ_SEMANTIC_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+        shadow_enabled = os.environ.get("KORZ_SHADOW_ENABLED", "0").strip().lower() in ("1", "true", "yes")
         return cls(
             data_dir=data_dir,
             db_path=db_path,
             sources_dir=sources_dir,
             backups_dir=backups_dir,
             semantic_enabled=semantic_enabled,
+            shadow_enabled=shadow_enabled,
         )
 
 
@@ -301,6 +308,7 @@ class SemanticIndex:
     chunk_ids: np.ndarray       # shape (N,), int64
     paragraph_ids: np.ndarray   # shape (N,), int64 (paragraph_start_id)
     doc_ids: np.ndarray         # shape (N,), object (document_id)
+    index_sha: str = ""         # SHA-256 fingerprint of the index matrix and structure
 
     @property
     def total_vectors(self) -> int:
@@ -404,6 +412,84 @@ def blob_to_vector(blob: bytes, expected_dim: int) -> np.ndarray:
     return arr
 
 
+def serialize_compact_candidates(results: List["SearchResult"], limit: int = 10) -> str:
+    """Format compact candidate JSON without bulky text payloads."""
+    entries = []
+    for rank, r in enumerate(results[:limit], 1):
+        entries.append({
+            "paragraph_id": r.paragraph_id,
+            "document_id": r.document_id,
+            "page": r.page,
+            "rank": rank,
+            "score": round(float(r.score), 4),
+        })
+    return json.dumps(entries, ensure_ascii=False)
+
+
+def compute_simulated_rrf(
+    fts_results: List["SearchResult"],
+    semantic_results: List["SearchResult"],
+    k: int = 60,
+    top_limit: int = 10,
+) -> Tuple[List[Dict[str, Any]], int, int, int]:
+    """
+    Compute Reciprocal Rank Fusion (RRF) simulation with fixed k parameter (default: 60).
+    RRF Score: sum(1.0 / (k + rank_m)) for m in {fts, sem}.
+    Returns:
+      (simulated_rrf_top, overlap_at_5, overlap_at_10, top1_match)
+    """
+    fts_top10 = fts_results[:10]
+    sem_top10 = semantic_results[:10]
+
+    fts_ranks: Dict[int, Tuple[int, "SearchResult"]] = {r.paragraph_id: (idx + 1, r) for idx, r in enumerate(fts_top10)}
+    sem_ranks: Dict[int, Tuple[int, "SearchResult"]] = {r.paragraph_id: (idx + 1, r) for idx, r in enumerate(sem_top10)}
+
+    fts_pids_5 = set(r.paragraph_id for r in fts_top10[:5])
+    sem_pids_5 = set(r.paragraph_id for r in sem_top10[:5])
+    overlap_at_5 = len(fts_pids_5 & sem_pids_5)
+
+    fts_pids_10 = set(fts_ranks.keys())
+    sem_pids_10 = set(sem_ranks.keys())
+    overlap_at_10 = len(fts_pids_10 & sem_pids_10)
+
+    top1_match = 1 if (fts_results and semantic_results and fts_results[0].paragraph_id == semantic_results[0].paragraph_id) else 0
+
+    all_pids = set(fts_ranks.keys()) | set(sem_ranks.keys())
+    scored_items = []
+    for pid in all_pids:
+        rrf_score = 0.0
+        rank_fts = None
+        rank_sem = None
+        sample_r = None
+
+        if pid in fts_ranks:
+            rank_fts, sample_r = fts_ranks[pid]
+            rrf_score += 1.0 / (k + rank_fts)
+        if pid in sem_ranks:
+            rank_sem, sem_r = sem_ranks[pid]
+            sample_r = sample_r or sem_r
+            rrf_score += 1.0 / (k + rank_sem)
+
+        rank_delta = (rank_fts - rank_sem) if (rank_fts is not None and rank_sem is not None) else None
+
+        scored_items.append({
+            "paragraph_id": pid,
+            "document_id": sample_r.document_id if sample_r else "",
+            "page": sample_r.page if sample_r else 0,
+            "score": round(rrf_score, 6),
+            "rank_fts": rank_fts,
+            "rank_sem": rank_sem,
+            "rank_delta": rank_delta,
+        })
+
+    # Sort descending by rrf score
+    scored_items.sort(key=lambda x: x["score"], reverse=True)
+    for idx, item in enumerate(scored_items[:top_limit], 1):
+        item["rank"] = idx
+
+    return scored_items[:top_limit], overlap_at_5, overlap_at_10, top1_match
+
+
 # Custom SQLite functions
 def _instr_ci(text: Optional[str], sub: Optional[str]) -> int:
     """Case-insensitive and apostrophe-normalized substring search for SQLite."""
@@ -428,7 +514,7 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     """Create and configure a SQLite connection with WAL mode and custom functions."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     # autocommit mode (isolation_level=None) prevents unintended implicit transactions & lock deadlocks
-    conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
+    conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA journal_mode = WAL;")
@@ -449,6 +535,8 @@ def init_database(conn: sqlite3.Connection, backups_dir: Optional[Path] = None) 
         _apply_migration_v1(conn)
     if current_version < 2:
         _apply_migration_v2(conn, backups_dir=backups_dir)
+
+    _ensure_shadow_tables(conn)
 
 
 def _apply_migration_v1(conn: sqlite3.Connection) -> None:
@@ -711,6 +799,57 @@ def _apply_migration_v2(conn: sqlite3.Connection, backups_dir: Optional[Path] = 
     except Exception as e:
         logger.error(f"Post-migration check error: {e}")
         raise
+
+
+def _ensure_shadow_tables(conn: sqlite3.Connection) -> None:
+    """
+    Ensure additive Phase V2C shadow evaluation & feedback tables exist:
+      - shadow_search_log (captures FTS vs Semantic dual retrieval, simulated RRF@60, provenance)
+      - search_feedback (captures explicit human relevance signal: thumbs up/down, target fragment)
+    """
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS shadow_search_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query TEXT NOT NULL,
+        doc_id TEXT,
+        fts_engine_version TEXT,
+        semantic_model_id TEXT NOT NULL,
+        semantic_index_sha TEXT,
+        latency_fts_ms REAL,
+        latency_semantic_ms REAL,
+        fts_count INTEGER NOT NULL,
+        semantic_count INTEGER NOT NULL,
+        overlap_at_5 INTEGER NOT NULL,
+        overlap_at_10 INTEGER NOT NULL,
+        top1_match INTEGER NOT NULL,
+        fts_top_json TEXT NOT NULL,
+        semantic_top_json TEXT NOT NULL,
+        simulated_rrf_json TEXT,
+        shadow_status TEXT NOT NULL,
+        error_message TEXT,
+        created_at TEXT NOT NULL
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_query ON shadow_search_log(query);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_created ON shadow_search_log(created_at);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_model_sha ON shadow_search_log(semantic_model_id, semantic_index_sha);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS search_feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shadow_log_id INTEGER,
+        query TEXT NOT NULL,
+        target_paragraph_id INTEGER,
+        target_rank INTEGER,
+        feedback_type TEXT NOT NULL,
+        user_id TEXT,
+        comment TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (shadow_log_id) REFERENCES shadow_search_log(id) ON DELETE SET NULL
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_query ON search_feedback(query);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_created ON search_feedback(created_at);")
 
 
 class TextProcessor:
@@ -1454,7 +1593,12 @@ class KorzLibrary:
         return " AND ".join(clauses)
 
     def search(
-        self, query: str, mode: str = "auto", limit: int = 10, doc_id: Optional[str] = None
+        self,
+        query: str,
+        mode: str = "auto",
+        limit: int = 10,
+        doc_id: Optional[str] = None,
+        shadow: Optional[bool] = None,
     ) -> List[SearchResult]:
         """
         Unified canonical search API for KORZ library.
@@ -1462,7 +1606,8 @@ class KorzLibrary:
           - 'auto'  (default): exact phrase if in quotes, otherwise FTS5 BM25 with exact fallback
           - 'exact': case-insensitive literal substring search
           - 'fts'  : FTS5 full-text search with BM25 ranking
-        Logs anonymous diagnostics to search_log for tuning & V2 design.
+          - 'semantic': dense vector retrieval
+        Logs anonymous diagnostics to search_log and triggers shadow evaluation if enabled.
         """
         if not query or not query.strip():
             return []
@@ -1514,6 +1659,20 @@ class KorzLibrary:
             )
         except Exception:
             pass  # Logging never disrupts search operations
+
+        # Phase V2C: Synchronous shadow evaluation if requested or shadow_enabled in config
+        should_shadow = shadow if shadow is not None else self.config.shadow_enabled
+        if should_shadow and mode in ("auto", "fts", "exact"):
+            try:
+                runner = ShadowRunner(self)
+                runner.evaluate_sync(
+                    query=clean_q,
+                    fts_results=results,
+                    doc_id=doc_id,
+                    latency_fts_ms=elapsed_ms,
+                )
+            except Exception as e:
+                logger.warning(f"Shadow evaluation failed: {e}")
 
         return results
 
@@ -2199,12 +2358,19 @@ class KorzLibrary:
         norms = np.where(norms == 0, 1.0, norms)
         matrix = matrix / norms
 
+        # Fingerprint the matrix & chunk structure
+        hasher = hashlib.sha256()
+        hasher.update(matrix.tobytes()[:65536])
+        hasher.update(f"{target_model}:{len(chunk_ids_list)}:{chunk_ids_list[0] if chunk_ids_list else 0}".encode("utf-8"))
+        idx_sha = hasher.hexdigest()[:16]
+
         index = SemanticIndex(
             model_id=target_model,
             matrix=matrix,
             chunk_ids=np.array(chunk_ids_list, dtype=np.int64),
             paragraph_ids=np.array(paragraph_ids_list, dtype=np.int64),
             doc_ids=np.array(doc_ids_list, dtype=object),
+            index_sha=idx_sha,
         )
 
         self._semantic_index = index
@@ -2384,13 +2550,14 @@ class KorzLibrary:
         limit: int = 10,
         doc_id: Optional[str] = None,
         model_id: Optional[str] = None,
+        internal_call: bool = False,
     ) -> List[SearchResult]:
         """
         Execute dense vector retrieval using in-memory matrix multiplication (matrix @ q_vec).
         Maps top chunk hits to their anchor paragraph (paragraph_start_id) and returns
         canonical SearchResults with original paragraph text and metadata.
         """
-        if not self.config.semantic_enabled:
+        if not internal_call and not self.config.semantic_enabled:
             raise RuntimeError("Semantic search is disabled. Set KORZ_SEMANTIC_ENABLED=1 to enable.")
 
         target_model = model_id or self._active_model_id or self.get_default_model_id()
@@ -2621,4 +2788,493 @@ class KorzLibrary:
             "issues_count": len(issues),
             "issues": issues[:10],
         }
+
+    # =========================================================================
+    # Phase V2C: Shadow Mode & Hybrid Analytics APIs
+    # =========================================================================
+
+    def record_feedback(
+        self,
+        query: str,
+        feedback_type: str,
+        shadow_log_id: Optional[int] = None,
+        target_paragraph_id: Optional[int] = None,
+        target_rank: Optional[int] = None,
+        user_id: Optional[str] = None,
+        comment: Optional[str] = None,
+    ) -> int:
+        """
+        Record explicit user relevance feedback (thumbs up/down, target fragment match).
+        Types:
+          - 'found' / 'up': User found the answer in shown results
+          - 'not_relevant' / 'down': Shown results were not relevant
+          - 'target': User pinpointed the exact desired paragraph
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT INTO search_feedback (
+                    shadow_log_id, query, target_paragraph_id, target_rank, feedback_type, user_id, comment, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (shadow_log_id, query.strip(), target_paragraph_id, target_rank, feedback_type, user_id, comment, now_iso),
+            )
+            return cur.lastrowid
+
+    def get_shadow_stats(self) -> Dict[str, Any]:
+        """Summary of shadow mode telemetry."""
+        try:
+            cur = self.conn.execute("SELECT COUNT(*) FROM shadow_search_log;")
+            total = cur.fetchone()[0]
+
+            cur_fail = self.conn.execute("SELECT COUNT(*) FROM shadow_search_log WHERE shadow_status = 'FAILED';")
+            failures = cur_fail.fetchone()[0]
+
+            cur_fb = self.conn.execute("SELECT COUNT(*) FROM search_feedback;")
+            feedback_count = cur_fb.fetchone()[0]
+
+            return {
+                "total_shadowed_queries": total,
+                "shadow_failures": failures,
+                "success_rate_pct": round(100.0 * (total - failures) / total, 1) if total > 0 else 100.0,
+                "feedback_count": feedback_count,
+            }
+        except Exception:
+            return {"total_shadowed_queries": 0, "shadow_failures": 0, "success_rate_pct": 100.0, "feedback_count": 0}
+
+    def get_shadow_report(self, limit_divergences: int = 20) -> Dict[str, Any]:
+        """
+        Produce comprehensive operational and retrieval divergence metrics from shadow_search_log
+        along with feedback-grounded Recall@1, Recall@5, and MRR.
+        """
+        cur = self.conn.execute("""
+            SELECT
+                id, query, doc_id, fts_engine_version, semantic_model_id, semantic_index_sha,
+                latency_fts_ms, latency_semantic_ms, fts_count, semantic_count,
+                overlap_at_5, overlap_at_10, top1_match, fts_top_json, semantic_top_json,
+                simulated_rrf_json, shadow_status, error_message, created_at
+            FROM shadow_search_log
+            ORDER BY id ASC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        total_queries = len(rows)
+
+        if total_queries == 0:
+            return {
+                "total_queries": 0,
+                "successful_queries": 0,
+                "failed_queries": 0,
+                "operational": {
+                    "queries_shadowed": 0,
+                    "shadow_failures": 0,
+                    "fts_latency_p50": 0.0,
+                    "fts_latency_p95": 0.0,
+                    "fts_latency_p99": 0.0,
+                    "semantic_latency_p50": 0.0,
+                    "semantic_latency_p95": 0.0,
+                    "semantic_latency_p99": 0.0,
+                },
+                "divergence": {
+                    "top1_match_count": 0,
+                    "top1_match_pct": 0.0,
+                    "overlap_5_zero_count": 0,
+                    "overlap_5_zero_pct": 0.0,
+                    "overlap_10_zero_count": 0,
+                    "overlap_10_zero_pct": 0.0,
+                    "fts_zero_semantic_hits": 0,
+                },
+                "relevance": {},
+                "top_divergences": [],
+            }
+
+        successful = [r for r in rows if r["shadow_status"] == "SUCCESS"]
+        failed = [r for r in rows if r["shadow_status"] != "SUCCESS"]
+
+        fts_lats = sorted([r["latency_fts_ms"] for r in successful if r["latency_fts_ms"] is not None])
+        sem_lats = sorted([r["latency_semantic_ms"] for r in successful if r["latency_semantic_ms"] is not None])
+
+        def percentile(arr, p):
+            if not arr:
+                return 0.0
+            k = (len(arr) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(arr) - 1)
+            d0 = arr[f] * (c - k)
+            d1 = arr[c] * (k - f)
+            return round(d0 + d1, 2)
+
+        op_metrics = {
+            "queries_shadowed": total_queries,
+            "shadow_failures": len(failed),
+            "fts_latency_p50": percentile(fts_lats, 0.50),
+            "fts_latency_p95": percentile(fts_lats, 0.95),
+            "fts_latency_p99": percentile(fts_lats, 0.99),
+            "semantic_latency_p50": percentile(sem_lats, 0.50),
+            "semantic_latency_p95": percentile(sem_lats, 0.95),
+            "semantic_latency_p99": percentile(sem_lats, 0.99),
+        }
+
+        top1_matches = sum(1 for r in successful if r["top1_match"] == 1)
+        overlap_5_zero = sum(1 for r in successful if r["overlap_at_5"] == 0)
+        overlap_10_zero = sum(1 for r in successful if r["overlap_at_10"] == 0)
+        fts_zero_sem_hits = sum(1 for r in successful if r["fts_count"] == 0 and r["semantic_count"] > 0)
+
+        n_succ = max(1, len(successful))
+        div_metrics = {
+            "top1_match_count": top1_matches,
+            "top1_match_pct": round(100.0 * top1_matches / n_succ, 1),
+            "overlap_5_zero_count": overlap_5_zero,
+            "overlap_5_zero_pct": round(100.0 * overlap_5_zero / n_succ, 1),
+            "overlap_10_zero_count": overlap_10_zero,
+            "overlap_10_zero_pct": round(100.0 * overlap_10_zero / n_succ, 1),
+            "fts_zero_semantic_hits": fts_zero_sem_hits,
+        }
+
+        # Feedback evaluation
+        cur_fb = self.conn.execute("SELECT * FROM search_feedback ORDER BY id ASC")
+        feedbacks = [dict(r) for r in cur_fb.fetchall()]
+
+        rel_metrics = {}
+        if feedbacks:
+            judged_queries = len(feedbacks)
+            target_feedbacks = [f for f in feedbacks if f["feedback_type"] in ("target", "found") and f.get("target_paragraph_id")]
+
+            fts_rec1 = 0
+            fts_rec5 = 0
+            sem_rec1 = 0
+            sem_rec5 = 0
+            rrf_rec1 = 0
+            rrf_rec5 = 0
+
+            fts_mrr_sum = 0.0
+            sem_mrr_sum = 0.0
+            rrf_mrr_sum = 0.0
+
+            log_map = {r["id"]: r for r in rows}
+            query_map = {r["query"]: r for r in rows}
+
+            evaluated_judgments = 0
+            for fb in target_feedbacks:
+                target_pid = fb["target_paragraph_id"]
+                log_entry = log_map.get(fb.get("shadow_log_id")) or query_map.get(fb.get("query"))
+                if not log_entry:
+                    continue
+
+                evaluated_judgments += 1
+                try:
+                    fts_top = json.loads(log_entry["fts_top_json"])
+                    sem_top = json.loads(log_entry["semantic_top_json"])
+                    rrf_top = json.loads(log_entry["simulated_rrf_json"]) if log_entry["simulated_rrf_json"] else []
+                except Exception:
+                    continue
+
+                f_rank = next((item["rank"] for item in fts_top if item["paragraph_id"] == target_pid), None)
+                if f_rank == 1:
+                    fts_rec1 += 1
+                if f_rank and f_rank <= 5:
+                    fts_rec5 += 1
+                if f_rank:
+                    fts_mrr_sum += 1.0 / f_rank
+
+                s_rank = next((item["rank"] for item in sem_top if item["paragraph_id"] == target_pid), None)
+                if s_rank == 1:
+                    sem_rec1 += 1
+                if s_rank and s_rank <= 5:
+                    sem_rec5 += 1
+                if s_rank:
+                    sem_mrr_sum += 1.0 / s_rank
+
+                r_rank = next((item["rank"] for item in rrf_top if item["paragraph_id"] == target_pid), None)
+                if r_rank == 1:
+                    rrf_rec1 += 1
+                if r_rank and r_rank <= 5:
+                    rrf_rec5 += 1
+                if r_rank:
+                    rrf_mrr_sum += 1.0 / r_rank
+
+            n_eval = max(1, evaluated_judgments)
+            thumbs_up = sum(1 for f in feedbacks if f["feedback_type"] in ("found", "up", "target"))
+            thumbs_down = sum(1 for f in feedbacks if f["feedback_type"] in ("not_relevant", "down"))
+
+            rel_metrics = {
+                "total_judged": judged_queries,
+                "target_judged": evaluated_judgments,
+                "thumbs_up": thumbs_up,
+                "thumbs_down": thumbs_down,
+                "user_satisfaction_pct": round(100.0 * thumbs_up / judged_queries, 1) if judged_queries else 0.0,
+                "fts_recall_at_1": round(fts_rec1 / n_eval, 3) if evaluated_judgments else None,
+                "fts_recall_at_5": round(fts_rec5 / n_eval, 3) if evaluated_judgments else None,
+                "fts_mrr": round(fts_mrr_sum / n_eval, 3) if evaluated_judgments else None,
+                "semantic_recall_at_1": round(sem_rec1 / n_eval, 3) if evaluated_judgments else None,
+                "semantic_recall_at_5": round(sem_rec5 / n_eval, 3) if evaluated_judgments else None,
+                "semantic_mrr": round(sem_mrr_sum / n_eval, 3) if evaluated_judgments else None,
+                "rrf_recall_at_1": round(rrf_rec1 / n_eval, 3) if evaluated_judgments else None,
+                "rrf_recall_at_5": round(rrf_rec5 / n_eval, 3) if evaluated_judgments else None,
+                "rrf_mrr": round(rrf_mrr_sum / n_eval, 3) if evaluated_judgments else None,
+            }
+
+        divergences = []
+        for r in successful:
+            if r["overlap_at_5"] == 0 or (r["fts_count"] == 0 and r["semantic_count"] > 0):
+                divergences.append({
+                    "id": r["id"],
+                    "query": r["query"],
+                    "fts_count": r["fts_count"],
+                    "semantic_count": r["semantic_count"],
+                    "overlap_at_5": r["overlap_at_5"],
+                    "overlap_at_10": r["overlap_at_10"],
+                    "top1_match": bool(r["top1_match"]),
+                    "latency_fts": r["latency_fts_ms"],
+                    "latency_sem": r["latency_semantic_ms"],
+                })
+
+        return {
+            "total_queries": total_queries,
+            "successful_queries": len(successful),
+            "failed_queries": len(failed),
+            "operational": op_metrics,
+            "divergence": div_metrics,
+            "relevance": rel_metrics,
+            "top_divergences": divergences[:limit_divergences],
+        }
+
+    def replay_shadow_evaluation(
+        self,
+        limit: int = 300,
+        since: Optional[str] = None,
+        model_id: Optional[str] = None,
+        force: bool = False,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Replay historical queries from search_log through shadow evaluation.
+        Idempotent: skips queries already evaluated for (query, model_id, semantic_index_sha) unless force=True.
+        """
+        target_model = model_id or self._active_model_id or self.get_default_model_id()
+        if not target_model:
+            raise ValueError("No embedding model registered for shadow replay.")
+
+        if self._semantic_index is None or self._semantic_index.model_id != target_model:
+            self.load_semantic_index(target_model)
+
+        index = self._semantic_index
+        index_sha = getattr(index, "index_sha", "") if index else ""
+
+        # Fetch queries from search_log
+        sql = "SELECT DISTINCT query FROM search_log WHERE 1=1"
+        params: List[Any] = []
+        if since:
+            sql += " AND created_at >= ?"
+            params.append(since)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        cur = self.conn.execute(sql, params)
+        queries = [r["query"].strip() for r in cur.fetchall() if r["query"] and r["query"].strip()]
+
+        if not queries:
+            return {"total": 0, "evaluated": 0, "skipped": 0, "failed": 0, "model_id": target_model, "index_sha": index_sha}
+
+        existing_queries = set()
+        if not force:
+            cur_ex = self.conn.execute(
+                """
+                SELECT DISTINCT query FROM shadow_search_log
+                WHERE semantic_model_id = ? AND semantic_index_sha = ? AND shadow_status = 'SUCCESS'
+                """,
+                (target_model, index_sha),
+            )
+            existing_queries = {r["query"].strip() for r in cur_ex.fetchall()}
+
+        runner = ShadowRunner(self)
+        evaluated = 0
+        skipped = 0
+        failed = 0
+
+        for idx, q in enumerate(queries, 1):
+            if q in existing_queries:
+                skipped += 1
+                if progress_callback:
+                    progress_callback({
+                        "current": idx,
+                        "total": len(queries),
+                        "evaluated": evaluated,
+                        "skipped": skipped,
+                        "failed": failed,
+                    })
+                continue
+
+            t0 = time.perf_counter()
+            fts_res = self._search_fts(q, limit=10)
+            lat_fts = (time.perf_counter() - t0) * 1000
+
+            res_id = runner.evaluate_sync(
+                query=q,
+                fts_results=fts_res,
+                latency_fts_ms=lat_fts,
+                model_id=target_model,
+            )
+            if res_id is not None:
+                evaluated += 1
+            else:
+                failed += 1
+
+            if progress_callback:
+                progress_callback({
+                    "current": idx,
+                    "total": len(queries),
+                    "evaluated": evaluated,
+                    "skipped": skipped,
+                    "failed": failed,
+                })
+
+        return {
+            "total": len(queries),
+            "evaluated": evaluated,
+            "skipped": skipped,
+            "failed": failed,
+            "model_id": target_model,
+            "index_sha": index_sha,
+        }
+
+
+class ShadowRunner:
+    """
+    Non-blocking background runner for shadow semantic evaluation and divergence logging.
+    Enforces bounded concurrency via asyncio.Semaphore so query bursts do not overload CPU.
+    Guarantees strict failure isolation: shadow errors NEVER affect primary user search.
+    """
+
+    def __init__(self, lib: "KorzLibrary", max_concurrency: int = 1):
+        self.lib = lib
+        self.max_concurrency = max_concurrency
+        self._semaphore: Optional[asyncio.Semaphore] = None
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrency)
+        return self._semaphore
+
+    def evaluate_sync(
+        self,
+        query: str,
+        fts_results: List[SearchResult],
+        doc_id: Optional[str] = None,
+        latency_fts_ms: float = 0.0,
+        model_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Synchronously compute semantic retrieval, compare divergence, and record in shadow_search_log.
+        Safe execution: all exceptions caught and logged without propagating.
+        """
+        if not query or not query.strip():
+            return None
+
+        clean_q = query.strip()
+        t0 = time.perf_counter()
+        target_model = model_id or self.lib._active_model_id or self.lib.get_default_model_id()
+        if not target_model:
+            logger.warning("Shadow evaluation skipped: no embedding model registered.")
+            return None
+
+        index_sha = ""
+        latency_sem_ms = 0.0
+        sem_results: List[SearchResult] = []
+        status = "SUCCESS"
+        err_msg = None
+
+        try:
+            if self.lib._semantic_index is None or self.lib._semantic_index.model_id != target_model:
+                self.lib.load_semantic_index(target_model)
+
+            index = self.lib._semantic_index
+            index_sha = getattr(index, "index_sha", "") if index else ""
+
+            # Perform semantic search with internal_call=True to bypass user-facing disabled flag
+            sem_results = self.lib._search_semantic(
+                clean_q, limit=10, doc_id=doc_id, model_id=target_model, internal_call=True
+            )
+            latency_sem_ms = (time.perf_counter() - t0) * 1000
+        except Exception as e:
+            latency_sem_ms = (time.perf_counter() - t0) * 1000
+            status = "FAILED"
+            err_msg = str(e)
+            logger.warning(f"Shadow semantic evaluation failed for '{clean_q[:50]}': {e}")
+
+        # Compute RRF and divergence metrics
+        simulated_rrf, overlap_at_5, overlap_at_10, top1_match = compute_simulated_rrf(
+            fts_results=fts_results,
+            semantic_results=sem_results,
+            k=60,
+            top_limit=10,
+        )
+
+        fts_json = serialize_compact_candidates(fts_results, limit=10)
+        sem_json = serialize_compact_candidates(sem_results, limit=10)
+        rrf_json = json.dumps(simulated_rrf, ensure_ascii=False)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        engine_ver = getattr(self.lib.config, "fts_engine_version", "sqlite-fts5-bm25-v1.1")
+
+        try:
+            with self.lib.conn:
+                cur = self.lib.conn.execute(
+                    """
+                    INSERT INTO shadow_search_log (
+                        query, doc_id, fts_engine_version, semantic_model_id, semantic_index_sha,
+                        latency_fts_ms, latency_semantic_ms, fts_count, semantic_count,
+                        overlap_at_5, overlap_at_10, top1_match, fts_top_json, semantic_top_json,
+                        simulated_rrf_json, shadow_status, error_message, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_q,
+                        doc_id,
+                        engine_ver,
+                        target_model,
+                        index_sha,
+                        round(latency_fts_ms, 2),
+                        round(latency_sem_ms, 2),
+                        len(fts_results),
+                        len(sem_results),
+                        overlap_at_5,
+                        overlap_at_10,
+                        top1_match,
+                        fts_json,
+                        sem_json,
+                        rrf_json,
+                        status,
+                        err_msg,
+                        now_iso,
+                    ),
+                )
+                return cur.lastrowid
+        except Exception as e:
+            logger.error(f"Failed to write shadow search log: {e}")
+            return None
+
+    async def evaluate_async(
+        self,
+        query: str,
+        fts_results: List[SearchResult],
+        doc_id: Optional[str] = None,
+        latency_fts_ms: float = 0.0,
+        model_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Asynchronously evaluate query in shadow mode with bounded concurrency.
+        Runs in background thread to never block asyncio event loop or Telegram polling.
+        """
+        sem = self._get_semaphore()
+        async with sem:
+            return await asyncio.to_thread(
+                self.evaluate_sync,
+                query=query,
+                fts_results=fts_results,
+                doc_id=doc_id,
+                latency_fts_ms=latency_fts_ms,
+                model_id=model_id,
+            )
 

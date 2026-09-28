@@ -472,6 +472,101 @@ def cmd_admin_migrate(args, lib: KorzLibrary) -> None:
     print("✅ Всі міграції застосовано успішно.\n")
 
 
+def cmd_shadow_status(args, lib: KorzLibrary) -> None:
+    st = lib.get_shadow_stats()
+    print("\n=== KORZ Shadow Mode Status ===")
+    print(f"Shadowed Queries:  {st['total_shadowed_queries']}")
+    print(f"Shadow Failures:   {st['shadow_failures']}")
+    print(f"Success Rate:      {st['success_rate_pct']}%")
+    print(f"User Feedbacks:    {st['feedback_count']}\n")
+
+
+def cmd_shadow_report(args, lib: KorzLibrary) -> None:
+    rep = lib.get_shadow_report(limit_divergences=getattr(args, "limit", 20))
+    if rep["total_queries"] == 0:
+        print("\nℹ️  Тіньовий лог порожній. Запитів ще не зафіксовано.")
+        print("💡 Виконайте пошуки через Telegram-бота (з KORZ_SHADOW_ENABLED=1)")
+        print("   або запустіть 'python korz.py shadow replay', щоб прогнати історію.\n")
+        return
+
+    op = rep["operational"]
+    div = rep["divergence"]
+    rel = rep["relevance"]
+
+    print("\n" + "=" * 65)
+    print("📊 KORZ Shadow Mode Telemetry & Divergence Report")
+    print("=" * 65)
+    print(f"Всього тіньових запитів:   {rep['total_queries']}")
+    print(f"Успішно обчислено:         {rep['successful_queries']} ({round(100.0 * rep['successful_queries'] / rep['total_queries'], 1)}%)")
+    print(f"Збоїв у фоні (failures):   {rep['failed_queries']}")
+
+    print("\n⏱️  Операційна латентність (CPU):")
+    print(f"  FTS5 / BM25:   P50: {op.get('fts_latency_p50', 0)} ms | P95: {op.get('fts_latency_p95', 0)} ms | P99: {op.get('fts_latency_p99', 0)} ms")
+    print(f"  Semantic:      P50: {op.get('semantic_latency_p50', 0)} ms | P95: {op.get('semantic_latency_p95', 0)} ms | P99: {op.get('semantic_latency_p99', 0)} ms")
+
+    print("\n🔀 Розходження видачі (Retrieval Divergence):")
+    print(f"  Top-1 однаковий (#1 збіг):     {div.get('top1_match_pct', 0)}% ({div.get('top1_match_count', 0)} / {rep['successful_queries']})")
+    print(f"  Overlap@5 = 0 (повністю різні): {div.get('overlap_5_zero_pct', 0)}% ({div.get('overlap_5_zero_count', 0)} / {rep['successful_queries']})")
+    print(f"  Overlap@10 = 0:                 {div.get('overlap_10_zero_pct', 0)}% ({div.get('overlap_10_zero_count', 0)} / {rep['successful_queries']})")
+    print(f"  FTS дав 0, а Semantic знайшов: {div.get('fts_zero_semantic_hits', 0)} запитів")
+
+    if rel and rel.get("total_judged", 0) > 0:
+        print("\n🎯 Користувацькі оцінки релевантності (Human Ground-Truth):")
+        print(f"  Всього відгуків:               {rel['total_judged']} (👍 {rel['thumbs_up']} | 👎 {rel['thumbs_down']})")
+        print(f"  Задоволеність користувача:     {rel['user_satisfaction_pct']}%")
+        if rel.get("target_judged", 0) > 0:
+            print(f"  Оцінених цільових запитів:     {rel['target_judged']}")
+            print(f"  FTS5 / BM25:   Recall@1: {rel['fts_recall_at_1']} | Recall@5: {rel['fts_recall_at_5']} | MRR: {rel['fts_mrr']}")
+            print(f"  Semantic:      Recall@1: {rel['semantic_recall_at_1']} | Recall@5: {rel['semantic_recall_at_5']} | MRR: {rel['semantic_mrr']}")
+            print(f"  RRF@60 Fusion: Recall@1: {rel['rrf_recall_at_1']} | Recall@5: {rel['rrf_recall_at_5']} | MRR: {rel['rrf_mrr']}")
+    else:
+        print("\nℹ️  Користувацьких оцінок (👍/👎/🎯) ще не додано.")
+        print("💡 Ставте реакції в Telegram-боті для автоматичного розрахунку Recall/MRR.")
+
+    top_div = rep.get("top_divergences", [])
+    if getattr(args, "detailed", False) and top_div:
+        print("\n🔍 Запити з найбільшим розходженням (Overlap@5 = 0 або FTS=0):")
+        print("─" * 65)
+        for d in top_div[:getattr(args, "limit", 20)]:
+            print(f"• ID #{d['id']}: «{d['query']}»")
+            print(f"  Hits: FTS={d['fts_count']} vs SEM={d['semantic_count']} | Overlap@5: {d['overlap_at_5']} | Top1 Same: {d['top1_match']}")
+            print(f"  Latency: FTS={d['latency_fts']}ms | SEM={d['latency_sem']}ms")
+            print("─" * 65)
+
+    print("=" * 65 + "\n")
+
+
+def cmd_shadow_replay(args, lib: KorzLibrary) -> None:
+    print(f"\n🔄 Запуск повторної тіньової оцінки (Shadow Replay)...")
+    if args.model:
+        print(f"• Цільова модель: {args.model}")
+    if args.since:
+        print(f"• Фільтр дати: від {args.since}")
+    print(f"• Ліміт запитів: {args.limit}")
+
+    def on_progress(p: Dict[str, Any]):
+        curr = p["current"]
+        tot = p["total"]
+        pct = int(100 * curr / tot) if tot > 0 else 0
+        sys.stdout.write(f"\r  [{curr}/{tot}] {pct}% | Оцінено: {p['evaluated']} | Пропущено: {p['skipped']} | Збоїв: {p['failed']}")
+        sys.stdout.flush()
+
+    res = lib.replay_shadow_evaluation(
+        limit=args.limit,
+        since=args.since,
+        model_id=args.model,
+        force=args.force,
+        progress_callback=on_progress,
+    )
+    print("\n\n✅ Shadow Replay завершено:")
+    print(f"  Всього запитів в історії: {res['total']}")
+    print(f"  Оцінено зараз:           {res['evaluated']}")
+    print(f"  Пропущено (вже в лозі):  {res['skipped']}")
+    print(f"  Збоїв:                   {res['failed']}")
+    print(f"  Model ID:                {res['model_id']}")
+    print(f"  Index SHA:               {res['index_sha']}\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="korz",
@@ -566,6 +661,22 @@ def main() -> None:
     p_admin_log = admin_sub.add_parser("search-log", help="Переглянути нещодавні запити без результатів (для аналізу V2)")
     p_admin_log.add_argument("--limit", type=int, default=20, help="Кількість записів (за замовчуванням: 20)")
 
+    # shadow (Phase V2C)
+    p_shadow = subparsers.add_parser("shadow", help="Аналітика та керування тіньовим режимом (Shadow Mode V2C)")
+    shadow_sub = p_shadow.add_subparsers(dest="shadow_command")
+
+    p_sh_report = shadow_sub.add_parser("report", help="Звіт розходжень між FTS5 та Semantic, латентності та оцінок")
+    p_sh_report.add_argument("--detailed", action="store_true", help="Показати детальний список запитів із найбільшими розходженнями")
+    p_sh_report.add_argument("--limit", type=int, default=20, help="Кількість записів у списку розходжень (за замовчуванням: 20)")
+
+    p_sh_replay = shadow_sub.add_parser("replay", help="Прогнати історичні запити з search_log через shadow evaluation")
+    p_sh_replay.add_argument("--limit", type=int, default=300, help="Максимальна кількість запитів для аналізу (за замовчуванням: 300)")
+    p_sh_replay.add_argument("--since", help="Фільтр за початковою датою (YYYY-MM-DD)")
+    p_sh_replay.add_argument("--model", help="ID або назва моделі")
+    p_sh_replay.add_argument("--force", action="store_true", help="Перерахувати навіть ті запити, що вже обчислені")
+
+    shadow_sub.add_parser("status", help="Коротка статистика збережених тіньових запитів та відгуків")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -618,6 +729,15 @@ def main() -> None:
                 cmd_admin_search_log(args, lib)
             else:
                 p_admin.print_help()
+        elif args.command == "shadow":
+            if args.shadow_command == "report":
+                cmd_shadow_report(args, lib)
+            elif args.shadow_command == "replay":
+                cmd_shadow_replay(args, lib)
+            elif args.shadow_command == "status":
+                cmd_shadow_status(args, lib)
+            else:
+                p_shadow.print_help()
     finally:
         lib.close()
 
