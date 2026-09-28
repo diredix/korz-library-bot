@@ -26,7 +26,10 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from korz_core import KorzLibrary, KorzConfig
+import time
+from typing import Any, Dict
+
+from korz_core import KorzLibrary, KorzConfig, EmbeddingContract, DEFAULT_E5_BASE_CONTRACT
 
 
 def cmd_add(args, lib: KorzLibrary) -> None:
@@ -102,11 +105,11 @@ def cmd_search(args, lib: KorzLibrary) -> None:
         print(f"\n🔍 Нічого не знайдено за запитом: «{query}»\n")
         return
 
-    mode_label = "Exact" if (results and results[0].match_type == "exact") else "FTS5 / BM25"
+    mode_label = "Exact" if (results and results[0].match_type == "exact") else ("Semantic" if (results and results[0].match_type == "semantic") else "FTS5 / BM25")
     print(f"\n🔎 Знайдено результатів: {len(results)} ({mode_label}: «{query}»)\n" + "─" * 60)
     for r in results:
         author_str = f"{r.author} — " if r.author else ""
-        score_str = f" (Score: {r.score:.4f})" if r.match_type == "fts" else ""
+        score_str = f" (Score: {r.score:.4f})" if r.match_type in ("fts", "semantic") else ""
         print(f"\n{author_str}{r.title}")
         print(f"Сторінка {r.page} (абзац {r.paragraph_index}) [ID: {r.paragraph_id}]{score_str}")
         print()
@@ -278,7 +281,7 @@ def cmd_admin_search_log(args, lib: KorzLibrary) -> None:
 
 def cmd_semantic_status(args, lib: KorzLibrary) -> None:
     sem = lib.get_semantic_status()
-    print("\n🧠 KORZ Semantic Infrastructure (Phase V2A):")
+    print("\n🧠 KORZ Semantic Infrastructure (Phase V2B):")
     print("─" * 50)
     print(f"Версія схеми:         v{sem['schema_version']}")
     print(f"Semantic enabled:     {'так' if sem['semantic_enabled'] else 'ні (KORZ_SEMANTIC_ENABLED=0)'}")
@@ -295,21 +298,171 @@ def cmd_semantic_status(args, lib: KorzLibrary) -> None:
 
 
 def cmd_semantic_verify(args, lib: KorzLibrary) -> None:
-    print("🔬 Перевірка цілісності семантичної інфраструктури (V2A)...")
-    res = lib.verify_semantic_integrity()
+    model_arg = getattr(args, "model", None)
+    print("\n🔬 KORZ Semantic Integrity Audit (V2B)...")
+    res = lib.verify_semantic_integrity(model_arg)
     print("─" * 50)
-    print(f"Перевірено моделей:    {res['models_checked']}")
-    print(f"Перевірено векторів:   {res['vectors_checked']}")
-    print(f"Застарілих векторів:   {res['stale_embeddings']}")
-    print(f"Знайдено проблем:      {res['issues_count']}")
-    if res["issues"]:
+    print(f"Model contract:        {'OK' if res['all_healthy'] else 'ISSUES'}")
+    print(f"Model ID:              {res.get('model_id') or 'N/A'}")
+    print(f"Model Name:            {res.get('model_name') or 'N/A'}")
+    print(f"Dimension:             {res.get('dimension', 0)}")
+    print(f"Chunks expected:       {res.get('chunks_expected', 0)}")
+    print(f"Embeddings present:    {res.get('embeddings_present', 0)}")
+    print(f"Missing:               {res.get('missing_embeddings', 0)}")
+    print(f"Stale SHA:             {res.get('stale_embeddings', 0)}")
+    print(f"Invalid BLOB:          {res.get('invalid_blob', 0)}")
+    print(f"NaN/Inf:               {res.get('nan_inf_count', 0)}")
+    print(f"Non-unit vectors:      {res.get('non_unit_vectors', 0)}")
+    print()
+    print(f"Documents READY:       {res.get('documents_ready', 0)} / {res.get('total_documents', 0)}")
+    print()
+    print("Matrix:")
+    print(f"{res.get('embeddings_present', 0)} × {res.get('dimension', 0)} float32")
+    print(f"{res.get('matrix_mib', 0.0)} MiB")
+    print()
+    print(f"Semantic index:        {'READY' if res.get('semantic_ready') else 'NOT READY'}")
+    print("─" * 50)
+    if res.get("issues"):
+        print("⚠️  Знайдені зауваження:")
         for iss in res["issues"]:
-            print(f" ⚠️  {iss}")
-    print("─" * 50)
-    if res["all_healthy"]:
-        print("✅ Семантична інфраструктура повністю здорова та консистентна.\n")
+            print(f" • {iss}")
+        print("─" * 50)
+    if res.get("semantic_ready"):
+        print("✅ Семантична інфраструктура повністю здорова та готова до пошуку.\n")
     else:
-        print("❌ Виявлено невідповідності в семантичному шарі!\n")
+        print("⚠️  Семантичний індекс ще не готовий або потребує запуску 'python korz.py semantic build'.\n")
+
+
+def cmd_semantic_build(args, lib: KorzLibrary) -> None:
+    model_arg = getattr(args, "model", None)
+    batch_size = getattr(args, "batch_size", 32)
+    force = getattr(args, "force", False)
+
+    print("\n🧠 KORZ Semantic Build (V2B)")
+    print("─" * 50)
+
+    st = lib.status()
+    total_docs = st["total_documents"]
+    total_chunks = st["total_chunks"]
+
+    target_display_model = model_arg or "intfloat/multilingual-e5-base"
+    print(f"Model:          {target_display_model}")
+    print(f"Documents:      {total_docs}")
+    print(f"Chunks:         {total_chunks}")
+
+    last_pct = -1
+
+    def on_progress(p: Dict[str, Any]) -> None:
+        nonlocal last_pct
+        to_emb = p.get("to_embed", 0)
+        done = p.get("embedded", 0)
+        if to_emb == 0:
+            pct = 100
+        else:
+            pct = int((done / to_emb) * 100)
+
+        if pct != last_pct and (pct % 5 == 0 or pct == 100):
+            last_pct = pct
+            bar_len = 20
+            filled = int(bar_len * pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            print(f"[{bar}] {pct:3d}% ({done}/{to_emb})", end="\r", flush=True)
+
+    try:
+        t0 = time.perf_counter()
+        res = lib.build_semantic_index(
+            model_id=model_arg,
+            batch_size=batch_size,
+            force=force,
+            progress_callback=on_progress,
+        )
+        elapsed = time.perf_counter() - t0
+        print("\n" + "─" * 50)
+        print(f"Embedded:       {res['embedded']}")
+        print(f"Cached:         {res['cached']}")
+        print(f"Failed:         {res['failed']}")
+
+        integrity = lib.verify_semantic_integrity(res["model_id"])
+        matrix_mb = integrity.get("matrix_mib", 0.0)
+        dim = integrity.get("dimension", 768)
+        print(f"Matrix:         {res['total_chunks']} × {dim} float32 (~{matrix_mb} MiB in RAM)")
+        print(f"Status:         {'READY' if res['ready'] else 'FAILED'}")
+        print(f"Час виконання:  {elapsed:.1f} с")
+        print("─" * 50)
+        if res["ready"]:
+            print("✅ Семантичний індекс успішно побудовано та перевірено!\n")
+        else:
+            print("❌ Побудову індексу завершено з помилками цілісності.\n")
+    except Exception as e:
+        print(f"\n❌ Помилка побудови семантичного індексу: {e}\n")
+        sys.exit(1)
+
+
+def cmd_semantic_search(args, lib: KorzLibrary) -> None:
+    query = args.query.strip()
+    limit = args.limit
+    doc_id = getattr(args, "doc", None)
+    model_id = getattr(args, "model", None)
+
+    try:
+        t0 = time.perf_counter()
+        results = lib.search(query, mode="semantic", limit=limit, doc_id=doc_id)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+    except Exception as e:
+        print(f"❌ Помилка семантичного пошуку: {e}")
+        sys.exit(1)
+
+    print(f"\n🧠 Знайдено результатів: {len(results)} (Semantic Search: «{query}» за {elapsed_ms:.1f} ms)")
+    print("─" * 60)
+    if not results:
+        print("Нічого не знайдено.")
+        print("─" * 60 + "\n")
+        return
+
+    for idx, r in enumerate(results, 1):
+        author_str = f"{r.author} — " if r.author else ""
+        print(f"\n{author_str}{r.title}")
+        print(f"Сторінка {r.page} (абзац {r.paragraph_index}) [ID: {r.paragraph_id}] (Cosine Score: {r.score:.4f})")
+        print(f"\n   {r.text}")
+        print("─" * 60)
+    print()
+
+
+def cmd_semantic_models(args, lib: KorzLibrary) -> None:
+    models = lib.list_embedding_models()
+    print("\n📚 Зареєстровані моделі ембедингів (V2B):")
+    print("─" * 60)
+    if not models:
+        print("Немає зареєстрованих моделей. Запустіть 'python korz.py semantic build' для автореєстрації.")
+        print("─" * 60 + "\n")
+        return
+
+    for m in models:
+        print(f"• ID:          {m['model_id']}")
+        print(f"  Name:        {m['model_name']}")
+        print(f"  Dimension:   {m['dimension']}")
+        print(f"  Metric:      {m['distance_metric']} (norm={m['normalization']})")
+        print(f"  Passage Tpl: {m['document_template']}")
+        print(f"  Query Tpl:   {m['query_template']}")
+        print(f"  Config SHA:  {m['config_sha256'][:16]}...")
+        print("─" * 60)
+    print()
+
+
+def cmd_semantic_register(args, lib: KorzLibrary) -> None:
+    contract = EmbeddingContract(
+        model_name=args.model,
+        dimension=args.dim,
+        query_template=args.query_tpl,
+        passage_template=args.passage_tpl,
+        model_max_tokens=args.max_tokens,
+    )
+    model_id = lib.register_embedding_model(contract)
+    print(f"\n✅ Модель успішно зареєстровано:")
+    print(f"  ID:          {model_id}")
+    print(f"  Name:        {contract.model_name}")
+    print(f"  Dimension:   {contract.dimension}")
+    print(f"  Max Tokens:  {contract.model_max_tokens}\n")
 
 
 def cmd_admin_migrate(args, lib: KorzLibrary) -> None:
@@ -322,7 +475,7 @@ def cmd_admin_migrate(args, lib: KorzLibrary) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="korz",
-        description="KORZ LOCAL — Локальна бібліотека та швидкий пошук по книгах (SQLite + FTS5)",
+        description="KORZ LOCAL — Локальна бібліотека та швидкий пошук по книгах (SQLite + FTS5 + Semantic)",
     )
     subparsers = parser.add_subparsers(dest="command", help="Команда для виконання")
 
@@ -339,10 +492,15 @@ def main() -> None:
     p_find.add_argument("--limit", type=int, default=10, help="Максимальна кількість результатів (за замовчуванням: 10)")
     p_find.add_argument("--doc", help="Фільтр за ID книги")
 
-    # search (fts/bm25/auto)
-    p_search = subparsers.add_parser("search", help="Пошук у бібліотеці (FTS5 / BM25 / Auto)")
+    # search (fts/bm25/auto/semantic)
+    p_search = subparsers.add_parser("search", help="Пошук у бібліотеці (Auto / FTS5 / Exact / Semantic)")
     p_search.add_argument("query", help="Пошуковий запит")
-    p_search.add_argument("--mode", choices=["auto", "fts", "exact"], default="auto", help="Режим пошуку (auto, fts, exact)")
+    p_search.add_argument(
+        "--mode",
+        choices=["auto", "fts", "exact", "semantic"],
+        default="auto",
+        help="Режим пошуку (auto, fts, exact, semantic)",
+    )
     p_search.add_argument("--limit", type=int, default=10, help="Максимальна кількість результатів (за замовчуванням: 10)")
     p_search.add_argument("--doc", help="Фільтр за ID книги")
 
@@ -375,7 +533,29 @@ def main() -> None:
     p_sem = subparsers.add_parser("semantic", help="Керування семантичним шаром V2 (інфраструктура ембедингів)")
     sem_sub = p_sem.add_subparsers(dest="semantic_command")
     sem_sub.add_parser("status", help="Стан семантичної інфраструктури, моделі та векторизовані чанки")
-    sem_sub.add_parser("verify", help="Перевірити цілісність векторів, розмірностей та відповідність SHA")
+
+    p_sem_verify = sem_sub.add_parser("verify", help="Перевірити цілісність векторів, розмірностей та відповідність SHA")
+    p_sem_verify.add_argument("--model", help="ID або назва моделі")
+
+    p_sem_build = sem_sub.add_parser("build", help="Побудувати або добудувати офлайн-індекс ембедингів")
+    p_sem_build.add_argument("--model", help="ID або назва моделі (за замовчуванням: intfloat/multilingual-e5-base)")
+    p_sem_build.add_argument("--batch-size", type=int, default=32, help="Розмір батчу для векторизації (за замовчуванням: 32)")
+    p_sem_build.add_argument("--force", action="store_true", help="Перерахувати ембединги заново, ігноруючи кеш")
+
+    p_sem_search = sem_sub.add_parser("search", help="Прямий семантичний пошук через векторну матрицю")
+    p_sem_search.add_argument("query", help="Пошуковий запит")
+    p_sem_search.add_argument("--limit", type=int, default=10, help="Кількість результатів")
+    p_sem_search.add_argument("--model", help="ID або назва моделі")
+    p_sem_search.add_argument("--doc", help="Фільтр за ID книги")
+
+    sem_sub.add_parser("models", help="Список зареєстрованих моделей ембедингів")
+
+    p_sem_reg = sem_sub.add_parser("register", help="Зареєструвати нову модель ембедингів")
+    p_sem_reg.add_argument("model", help="Назва моделі на HuggingFace (напр. intfloat/multilingual-e5-base)")
+    p_sem_reg.add_argument("--dim", type=int, default=768, help="Розмірність векторів")
+    p_sem_reg.add_argument("--query-tpl", default="query: {text}", help="Шаблон запиту")
+    p_sem_reg.add_argument("--passage-tpl", default="passage: {text}", help="Шаблон чанка")
+    p_sem_reg.add_argument("--max-tokens", type=int, default=512, help="Ліміт токенів моделі")
 
     # admin
     p_admin = subparsers.add_parser("admin", help="Адміністративні інструменти")
@@ -417,6 +597,14 @@ def main() -> None:
                 cmd_semantic_status(args, lib)
             elif args.semantic_command == "verify":
                 cmd_semantic_verify(args, lib)
+            elif args.semantic_command == "build":
+                cmd_semantic_build(args, lib)
+            elif args.semantic_command == "search":
+                cmd_semantic_search(args, lib)
+            elif args.semantic_command == "models":
+                cmd_semantic_models(args, lib)
+            elif args.semantic_command == "register":
+                cmd_semantic_register(args, lib)
             else:
                 p_sem.print_help()
         elif args.command == "admin":

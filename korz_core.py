@@ -24,10 +24,11 @@ import shutil
 import sqlite3
 import sys
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -130,12 +131,20 @@ class EmbeddingContract:
     """Canonical specification of an embedding model configuration."""
     model_name: str
     model_revision: Optional[str] = None
-    dimension: int = 1024
+    dimension: int = 768
     dtype: str = "float32"
     normalization: str = "l2"
     pooling: Optional[str] = "mean"
     query_template: str = "{text}"
     passage_template: str = "{text}"
+    document_template: Optional[str] = None
+    model_max_tokens: int = 512
+
+    def __post_init__(self) -> None:
+        if self.document_template is not None and self.passage_template == "{text}":
+            object.__setattr__(self, "passage_template", self.document_template)
+        elif self.document_template is None:
+            object.__setattr__(self, "document_template", self.passage_template)
 
     def to_canonical_dict(self) -> Dict[str, Any]:
         return {
@@ -147,6 +156,7 @@ class EmbeddingContract:
             "pooling": self.pooling.lower() if self.pooling else None,
             "query_template": self.query_template,
             "passage_template": self.passage_template,
+            "model_max_tokens": int(self.model_max_tokens),
         }
 
     def compute_config_sha256(self) -> str:
@@ -158,6 +168,191 @@ class EmbeddingContract:
         clean_name = re.sub(r"[^a-zA-Z0-9]+", "-", self.model_name.split("/")[-1].lower()).strip("-")
         config_hash = self.compute_config_sha256()[:12]
         return f"emb-{clean_name}-{config_hash}"
+
+
+DEFAULT_E5_BASE_CONTRACT = EmbeddingContract(
+    model_name="intfloat/multilingual-e5-base",
+    dimension=768,
+    dtype="float32",
+    normalization="l2",
+    pooling="mean",
+    query_template="query: {text}",
+    passage_template="passage: {text}",
+    model_max_tokens=512,
+)
+
+
+class EmbeddingBackend(ABC):
+    """Abstract interface for local embedding model inference."""
+
+    @abstractmethod
+    def encode_passages(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        """Encode list of passage texts into an (N, D) float32 L2-normalized numpy array."""
+        pass
+
+    @abstractmethod
+    def encode_queries(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        """Encode list of query texts into an (N, D) float32 L2-normalized numpy array."""
+        pass
+
+    @abstractmethod
+    def count_tokens(self, text: str) -> int:
+        """Count tokens according to model tokenizer."""
+        pass
+
+
+class FastEmbedBackend(EmbeddingBackend):
+    """Fast local CPU ONNX embedding backend via FastEmbed."""
+
+    def __init__(self, model_name: str, cache_dir: Optional[str] = None):
+        try:
+            from fastembed import TextEmbedding
+            from fastembed.common.model_description import PoolingType, ModelSource
+        except ImportError as e:
+            raise ImportError("fastembed is not installed. Run: pip install fastembed") from e
+
+        self.model_name = model_name
+        supported = [m["model"] for m in TextEmbedding.list_supported_models()]
+        if model_name == "intfloat/multilingual-e5-base" and model_name not in supported:
+            try:
+                TextEmbedding.add_custom_model(
+                    model="intfloat/multilingual-e5-base",
+                    pooling=PoolingType.MEAN,
+                    normalization=True,
+                    sources=ModelSource(hf="Xenova/multilingual-e5-base"),
+                    dim=768,
+                    model_file="onnx/model.onnx",
+                    description="Multilingual E5 base model via Xenova ONNX",
+                )
+            except Exception:
+                pass
+
+        self._model = TextEmbedding(model_name, cache_dir=cache_dir)
+
+    def encode_passages(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        if not texts:
+            return np.empty((0, 0), dtype=np.float32)
+        embs = list(self._model.embed(texts, batch_size=batch_size))
+        arr = np.asarray(embs, dtype=np.float32)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return arr / norms
+
+    def encode_queries(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        if not texts:
+            return np.empty((0, 0), dtype=np.float32)
+        embs = list(self._model.embed(texts, batch_size=batch_size))
+        arr = np.asarray(embs, dtype=np.float32)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return arr / norms
+
+    def count_tokens(self, text: str) -> int:
+        if hasattr(self._model, "token_count"):
+            try:
+                return int(self._model.token_count(text))
+            except Exception:
+                pass
+        return max(1, len(text) // 4)
+
+
+class MockEmbeddingBackend(EmbeddingBackend):
+    """Deterministic, fast mock backend for testing without external models."""
+
+    def __init__(self, dimension: int = 768):
+        self.dimension = dimension
+
+    def encode_passages(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        return self._pseudo_vectors(texts)
+
+    def encode_queries(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        return self._pseudo_vectors(texts)
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+    def _pseudo_vectors(self, texts: List[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self.dimension), dtype=np.float32)
+        vecs = []
+        for t in texts:
+            seed = int.from_bytes(hashlib.sha256(t.encode("utf-8")).digest()[:4], "little")
+            rng = np.random.default_rng(seed)
+            arr = rng.standard_normal(self.dimension).astype(np.float32)
+            norm = float(np.linalg.norm(arr))
+            if norm == 0 or not np.isfinite(norm):
+                arr[0] = 1.0
+                norm = 1.0
+            vecs.append(arr / norm)
+        return np.vstack(vecs).astype(np.float32)
+
+
+def get_embedding_backend(model_name: str, cache_dir: Optional[str] = None) -> EmbeddingBackend:
+    if model_name.startswith("mock://") or model_name == "mock":
+        return MockEmbeddingBackend()
+    return FastEmbedBackend(model_name, cache_dir=cache_dir)
+
+
+@dataclass(frozen=True)
+class SemanticIndex:
+    """Immutable snapshot of the in-memory semantic vector index."""
+    model_id: str
+    matrix: np.ndarray          # shape (N, D), float32, L2-normalized
+    chunk_ids: np.ndarray       # shape (N,), int64
+    paragraph_ids: np.ndarray   # shape (N,), int64 (paragraph_start_id)
+    doc_ids: np.ndarray         # shape (N,), object (document_id)
+
+    @property
+    def total_vectors(self) -> int:
+        return len(self.chunk_ids)
+
+    @property
+    def dimension(self) -> int:
+        return self.matrix.shape[1] if self.matrix.ndim == 2 else 0
+
+    @property
+    def memory_size_bytes(self) -> int:
+        return int(self.matrix.nbytes + self.chunk_ids.nbytes + self.paragraph_ids.nbytes + self.doc_ids.nbytes)
+
+    @property
+    def memory_size_mb(self) -> float:
+        return round(self.memory_size_bytes / (1024 * 1024), 2)
+
+
+def build_embedding_input(
+    raw_text: str,
+    template: str = "{text}",
+    model_max_tokens: int = 512,
+    backend: Optional[EmbeddingBackend] = None,
+) -> str:
+    """
+    Build canonical embedding input with deterministic whitespace normalization
+    and strict token limit compliance.
+    """
+    normalized_raw = " ".join(raw_text.split())
+    formatted = template.format(text=normalized_raw) if "{text}" in template else normalized_raw
+
+    if backend is None or model_max_tokens <= 0:
+        return formatted
+
+    tokens_count = backend.count_tokens(formatted)
+    if tokens_count <= model_max_tokens:
+        return formatted
+
+    # Deterministic character-based binary search truncation so formatted text <= model_max_tokens
+    low, high = 0, len(normalized_raw)
+    best_formatted = formatted
+    while low <= high:
+        mid = (low + high) // 2
+        cand_raw = normalized_raw[:mid].rstrip()
+        cand_formatted = template.format(text=cand_raw) if "{text}" in template else cand_raw
+        if backend.count_tokens(cand_formatted) <= model_max_tokens:
+            best_formatted = cand_formatted
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    return best_formatted
 
 
 def build_embedding_text(text: str, template: str = "{text}") -> str:
@@ -954,6 +1149,25 @@ class KorzLibrary:
         self.config = config or KorzConfig.from_env()
         self.conn = get_connection(self.config.db_path)
         init_database(self.conn, backups_dir=self.config.backups_dir)
+        self._semantic_index: Optional[SemanticIndex] = None
+        self._active_model_id: Optional[str] = None
+        self._backends: Dict[str, EmbeddingBackend] = {}
+
+    def get_backend(self, model_name: str) -> EmbeddingBackend:
+        """Get or initialize embedding backend for model_name."""
+        if model_name not in self._backends:
+            self._backends[model_name] = get_embedding_backend(model_name)
+        return self._backends[model_name]
+
+    def set_backend(self, model_name: str, backend: EmbeddingBackend) -> None:
+        """Inject or override an embedding backend (useful for testing and mocks)."""
+        self._backends[model_name] = backend
+
+    def get_default_model_id(self) -> Optional[str]:
+        """Return the default/primary embedding model ID if any model is registered."""
+        cur = self.conn.execute("SELECT model_id FROM embedding_models ORDER BY created_at ASC LIMIT 1")
+        row = cur.fetchone()
+        return row["model_id"] if row else None
 
     def close(self) -> None:
         """Close SQLite database connection."""
@@ -1255,10 +1469,22 @@ class KorzLibrary:
 
         clean_q = query.strip()
         if mode == "semantic":
-            raise NotImplementedError(
-                "Semantic retrieval is in development (Phase V2A infrastructure complete). "
-                "Semantic search will be activated in Phase V2B. Active modes: 'auto', 'exact', 'fts'."
-            )
+            t0 = time.perf_counter()
+            results = self._search_semantic(clean_q, limit=limit, doc_id=doc_id)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            try:
+                top_id = results[0].paragraph_id if results else None
+                now_iso = datetime.now(timezone.utc).isoformat()
+                self.conn.execute(
+                    """
+                    INSERT INTO search_log (query, mode, result_count, top_result_id, latency_ms, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (clean_q[:250], mode, len(results), top_id, round(elapsed_ms, 2), now_iso),
+                )
+            except Exception:
+                pass
+            return results
 
         t0 = time.perf_counter()
 
@@ -1922,10 +2148,339 @@ class KorzLibrary:
             "models": models,
             "total_documents": cur_tot_docs,
             "documents_ready": ready_docs,
+            "ready_documents": ready_docs,
             "total_chunks": cur_tot_chunks,
             "chunks_embedded": embedded_count,
             "fts5_baseline": "READY",
         }
+
+    def load_semantic_index(self, model_id: Optional[str] = None) -> SemanticIndex:
+        """
+        Load all chunk embeddings for model_id from SQLite into an immutable in-memory SemanticIndex.
+        Deterministic ordering by chunk_id ensures stable row mapping:
+        matrix[row] <-> chunk_ids[row] <-> paragraph_ids[row] <-> doc_ids[row].
+        """
+        target_model = model_id or self._active_model_id or self.get_default_model_id()
+        if not target_model:
+            raise RuntimeError("No embedding model registered in KORZ library.")
+
+        model_info = self.get_embedding_model(target_model)
+        if not model_info:
+            raise ValueError(f"Embedding model '{target_model}' not found in library.")
+
+        dim = model_info["dimension"]
+        cur = self.conn.execute(
+            """
+            SELECT ce.chunk_id, ce.vector, c.paragraph_start_id, c.document_id
+            FROM chunk_embeddings ce
+            JOIN chunks c ON ce.chunk_id = c.id
+            WHERE ce.model_id = ?
+            ORDER BY ce.chunk_id ASC
+            """,
+            (target_model,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            raise RuntimeError(f"No embeddings found for model '{target_model}'. Run 'python korz.py semantic build'.")
+
+        chunk_ids_list: List[int] = []
+        paragraph_ids_list: List[int] = []
+        doc_ids_list: List[str] = []
+        vectors_list: List[np.ndarray] = []
+
+        for r in rows:
+            chunk_ids_list.append(r["chunk_id"])
+            paragraph_ids_list.append(r["paragraph_start_id"])
+            doc_ids_list.append(r["document_id"])
+            vectors_list.append(blob_to_vector(r["vector"], dim))
+
+        matrix = np.vstack(vectors_list).astype(np.float32)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        matrix = matrix / norms
+
+        index = SemanticIndex(
+            model_id=target_model,
+            matrix=matrix,
+            chunk_ids=np.array(chunk_ids_list, dtype=np.int64),
+            paragraph_ids=np.array(paragraph_ids_list, dtype=np.int64),
+            doc_ids=np.array(doc_ids_list, dtype=object),
+        )
+
+        self._semantic_index = index
+        self._active_model_id = target_model
+        return index
+
+    def build_semantic_index(
+        self,
+        model_id: Optional[str] = None,
+        backend: Optional[EmbeddingBackend] = None,
+        batch_size: int = 32,
+        force: bool = False,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Resume-safe offline semantic build with short transactional batch commits.
+        Transitions semantic_state from INDEXING to READY only after final verification.
+        """
+        # 1. Resolve or auto-register model
+        target_model = model_id
+        if target_model is None:
+            target_model = self.get_default_model_id()
+            if not target_model:
+                target_model = self.register_embedding_model(DEFAULT_E5_BASE_CONTRACT)
+
+        model_info = self.get_embedding_model(target_model)
+        if not model_info:
+            for m in self.list_embedding_models():
+                if m["model_name"] == target_model:
+                    target_model = m["model_id"]
+                    model_info = m
+                    break
+            if not model_info:
+                if "e5-base" in str(target_model).lower():
+                    target_model = self.register_embedding_model(DEFAULT_E5_BASE_CONTRACT)
+                    model_info = self.get_embedding_model(target_model)
+                else:
+                    raise ValueError(f"Model '{target_model}' not registered in library.")
+
+        dim = model_info["dimension"]
+        passage_tpl = model_info.get("passage_template") or model_info.get("document_template") or "passage: {text}"
+        model_max_tokens = model_info.get("model_max_tokens", 512)
+
+        if backend is None:
+            backend = self.get_backend(model_info["model_name"])
+
+        # 2. Query all chunks
+        cur = self.conn.execute(
+            """
+            SELECT c.id, c.document_id, c.paragraph_start_id, c.display_text
+            FROM chunks c
+            ORDER BY c.document_id, c.id ASC
+            """
+        )
+        all_chunks = cur.fetchall()
+        total_chunks = len(all_chunks)
+        if total_chunks == 0:
+            return {"model_id": target_model, "total_chunks": 0, "embedded": 0, "cached": 0, "failed": 0, "ready": False}
+
+        # 3. Transition document states to INDEXING
+        doc_ids = sorted(list({c["document_id"] for c in all_chunks}))
+        for d_id in doc_ids:
+            cur_d = self.conn.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ?", (d_id,))
+            doc_total = cur_d.fetchone()[0]
+            self.update_semantic_state(d_id, target_model, status="INDEXING", embedded_chunks=0, total_chunks=doc_total)
+
+        # 4. Check existing embeddings for resume-safety
+        cur_existing = self.conn.execute(
+            "SELECT chunk_id, text_sha256 FROM chunk_embeddings WHERE model_id = ?",
+            (target_model,),
+        )
+        existing_map = {r["chunk_id"]: r["text_sha256"] for r in cur_existing.fetchall()}
+
+        cached_chunks: List[int] = []
+        to_embed: List[Tuple[int, str, str, str]] = []
+
+        for c in all_chunks:
+            c_id = c["id"]
+            d_id = c["document_id"]
+            raw_text = c["display_text"]
+            emb_input = build_embedding_input(raw_text, passage_tpl, model_max_tokens, backend)
+            sha = compute_text_sha256(emb_input)
+
+            if not force and c_id in existing_map and existing_map[c_id] == sha:
+                cached_chunks.append(c_id)
+            else:
+                to_embed.append((c_id, d_id, emb_input, sha))
+
+        if progress_callback:
+            progress_callback({
+                "status": "indexing",
+                "total": total_chunks,
+                "cached": len(cached_chunks),
+                "to_embed": len(to_embed),
+                "embedded": 0,
+            })
+
+        # 5. Batch embedding generation with short transactional commits
+        embedded_count = 0
+        failed_count = 0
+
+        for i in range(0, len(to_embed), batch_size):
+            batch = to_embed[i : i + batch_size]
+            texts = [item[2] for item in batch]
+            try:
+                vectors = backend.encode_passages(texts, batch_size=len(texts))
+            except Exception as e:
+                failed_count += len(batch)
+                logger.error(f"Error embedding batch starting at {i}: {e}")
+                continue
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with self.conn:
+                for (c_id, d_id, _, sha), vec in zip(batch, vectors):
+                    blob = vector_to_blob(vec, dim, normalize=True)
+                    self.conn.execute(
+                        """
+                        INSERT INTO chunk_embeddings (chunk_id, model_id, text_sha256, vector, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(chunk_id, model_id) DO UPDATE SET
+                            text_sha256 = excluded.text_sha256,
+                            vector = excluded.vector,
+                            created_at = excluded.created_at
+                        """,
+                        (c_id, target_model, sha, blob, now_iso),
+                    )
+
+            embedded_count += len(batch)
+            if progress_callback:
+                progress_callback({
+                    "status": "indexing",
+                    "total": total_chunks,
+                    "cached": len(cached_chunks),
+                    "to_embed": len(to_embed),
+                    "embedded": embedded_count,
+                })
+
+        # 6. Verification and Status Transition
+        integrity = self.verify_semantic_integrity(target_model)
+        is_ready = integrity["all_healthy"] and integrity["missing_embeddings"] == 0 and failed_count == 0
+
+        for d_id in doc_ids:
+            cur_d = self.conn.execute(
+                """
+                SELECT COUNT(ce.chunk_id)
+                FROM chunks c
+                JOIN chunk_embeddings ce ON ce.chunk_id = c.id AND ce.model_id = ?
+                WHERE c.document_id = ?
+                """,
+                (target_model, d_id),
+            )
+            emb_for_doc = cur_d.fetchone()[0]
+            cur_tot = self.conn.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ?", (d_id,))
+            tot_for_doc = cur_tot.fetchone()[0]
+
+            new_status = "READY" if (is_ready and emb_for_doc == tot_for_doc) else "FAILED"
+            err = None if new_status == "READY" else "Integrity check failed"
+            self.update_semantic_state(
+                d_id, target_model, status=new_status, embedded_chunks=emb_for_doc, total_chunks=tot_for_doc, last_error=err
+            )
+
+        if is_ready:
+            self.load_semantic_index(target_model)
+
+        return {
+            "model_id": target_model,
+            "total_chunks": total_chunks,
+            "cached": len(cached_chunks),
+            "embedded": embedded_count,
+            "failed": failed_count,
+            "ready": is_ready,
+        }
+
+    def _search_semantic(
+        self,
+        query: str,
+        limit: int = 10,
+        doc_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> List[SearchResult]:
+        """
+        Execute dense vector retrieval using in-memory matrix multiplication (matrix @ q_vec).
+        Maps top chunk hits to their anchor paragraph (paragraph_start_id) and returns
+        canonical SearchResults with original paragraph text and metadata.
+        """
+        if not self.config.semantic_enabled:
+            raise RuntimeError("Semantic search is disabled. Set KORZ_SEMANTIC_ENABLED=1 to enable.")
+
+        target_model = model_id or self._active_model_id or self.get_default_model_id()
+        if not target_model:
+            raise RuntimeError("Semantic index is not ready. Use FTS5 or run 'python korz.py semantic build'.")
+
+        if self._semantic_index is None or self._semantic_index.model_id != target_model:
+            try:
+                self.load_semantic_index(target_model)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Semantic index is not ready. Use FTS5 or run 'python korz.py semantic build'. Details: {e}"
+                ) from e
+
+        # Ensure index is in READY state
+        status = self.get_semantic_status(target_model)
+        if status["ready_documents"] < status["total_documents"] or status["ready_documents"] == 0:
+            raise RuntimeError(
+                f"Semantic index is not ready ({status['ready_documents']}/{status['total_documents']} docs ready). "
+                f"Use FTS5 or run 'python korz.py semantic build'."
+            )
+
+        model_info = self.get_embedding_model(target_model)
+        query_tpl = model_info.get("query_template") or "query: {text}"
+        clean_q = " ".join(query.strip().split())
+        query_input = query_tpl.format(text=clean_q) if "{text}" in query_tpl else clean_q
+
+        backend = self.get_backend(model_info["model_name"])
+        q_vec = backend.encode_queries([query_input])[0]
+
+        # Dot product with normalized matrix yields cosine similarity
+        scores = self._semantic_index.matrix @ q_vec
+
+        # Apply document filter if requested
+        if doc_id is not None:
+            mask = (self._semantic_index.doc_ids == doc_id)
+            scores = np.where(mask, scores, -1e9)
+
+        # Retrieve candidates and deduplicate by paragraph
+        fetch_k = min(len(scores), max(limit * 3, 20))
+        top_indices = np.argsort(scores)[::-1][:fetch_k]
+
+        results: List[SearchResult] = []
+        seen_paras: set = set()
+
+        for idx in top_indices:
+            score = float(scores[idx])
+            if score <= -1e8:
+                continue
+
+            p_id = int(self._semantic_index.paragraph_ids[idx])
+            if p_id in seen_paras:
+                continue
+            seen_paras.add(p_id)
+
+            cur = self.conn.execute(
+                """
+                SELECT p.id, p.document_id, d.title, d.author, p.page_number, p.paragraph_index, p.display_text
+                FROM paragraphs p
+                JOIN documents d ON d.id = p.document_id
+                WHERE p.id = ?
+                """,
+                (p_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                continue
+
+            text = row["display_text"]
+            snippet = text[:280] + ("..." if len(text) > 280 else "")
+
+            results.append(
+                SearchResult(
+                    paragraph_id=row["id"],
+                    document_id=row["document_id"],
+                    title=row["title"],
+                    author=row["author"],
+                    page=row["page_number"],
+                    paragraph_index=row["paragraph_index"],
+                    text=text,
+                    snippet=snippet,
+                    score=round(score, 4),
+                    match_type="semantic",
+                )
+            )
+
+            if len(results) >= limit:
+                break
+
+        return results
 
     def verify_semantic_integrity(self, model_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -1938,82 +2493,131 @@ class KorzLibrary:
           - Ready documents chunk parity
         """
         models = self.list_embedding_models()
-        target_models = [m for m in models if m["model_id"] == model_id] if model_id else models
+        target_model = model_id or self.get_default_model_id()
+        if not target_model:
+            return {
+                "all_healthy": True,
+                "model_id": None,
+                "model_name": None,
+                "dimension": 0,
+                "chunks_expected": 0,
+                "embeddings_present": 0,
+                "missing_embeddings": 0,
+                "stale_embeddings": 0,
+                "invalid_blob": 0,
+                "nan_inf_count": 0,
+                "non_unit_vectors": 0,
+                "documents_ready": 0,
+                "total_documents": 0,
+                "matrix_mib": 0.0,
+                "semantic_ready": False,
+                "issues": [],
+            }
 
-        issues: List[str] = []
-        vectors_checked = 0
+        m = self.get_embedding_model(target_model)
+        if not m:
+            return {"all_healthy": False, "issues": [f"Model '{target_model}' not found."]}
+
+        dim = m["dimension"]
+        expected_bytes = dim * 4
+        passage_tpl = m.get("passage_template") or m.get("document_template") or "passage: {text}"
+        model_max_tokens = m.get("model_max_tokens", 512)
+
+        cur_tot = self.conn.execute("SELECT COUNT(*) FROM chunks")
+        chunks_expected = cur_tot.fetchone()[0]
+
+        cur_docs = self.conn.execute("SELECT COUNT(*) FROM documents")
+        total_documents = cur_docs.fetchone()[0]
+
+        cur_ready = self.conn.execute(
+            "SELECT COUNT(*) FROM semantic_state WHERE model_id = ? AND status = 'READY'",
+            (target_model,),
+        )
+        documents_ready = cur_ready.fetchone()[0]
+
+        cur = self.conn.execute(
+            """
+            SELECT ce.chunk_id, ce.text_sha256, ce.vector, c.display_text
+            FROM chunk_embeddings ce
+            JOIN chunks c ON ce.chunk_id = c.id
+            WHERE ce.model_id = ?
+            """,
+            (target_model,),
+        )
+        rows = cur.fetchall()
+        embeddings_present = len(rows)
+        missing_embeddings = max(0, chunks_expected - embeddings_present)
+
         stale_embeddings = 0
+        invalid_blob = 0
+        nan_inf_count = 0
+        non_unit_vectors = 0
+        issues: List[str] = []
 
-        for m in target_models:
-            m_id = m["model_id"]
-            dim = m["dimension"]
-            expected_bytes = dim * 4
-            passage_tpl = m.get("passage_template") or "{text}"
+        if missing_embeddings > 0:
+            issues.append(f"Missing {missing_embeddings} chunk embeddings")
 
-            # 1. Check all vectors for this model
-            cur = self.conn.execute(
-                """
-                SELECT ce.chunk_id, ce.text_sha256, ce.vector, c.display_text
-                FROM chunk_embeddings ce
-                JOIN chunks c ON ce.chunk_id = c.id
-                WHERE ce.model_id = ?
-                """,
-                (m_id,),
-            )
-            for row in cur.fetchall():
-                vectors_checked += 1
-                b = row["vector"]
-                if len(b) != expected_bytes:
-                    issues.append(f"Chunk {row['chunk_id']}: blob size {len(b)} != expected {expected_bytes}")
-                    continue
+        for row in rows:
+            b = row["vector"]
+            if len(b) != expected_bytes:
+                invalid_blob += 1
+                issues.append(f"Chunk {row['chunk_id']}: blob size {len(b)} != expected {expected_bytes}")
+                continue
 
-                arr = np.frombuffer(b, dtype=np.float32)
-                if not np.all(np.isfinite(arr)):
-                    issues.append(f"Chunk {row['chunk_id']}: vector contains non-finite values")
-                    continue
+            arr = np.frombuffer(b, dtype=np.float32)
+            if not np.all(np.isfinite(arr)):
+                nan_inf_count += 1
+                issues.append(f"Chunk {row['chunk_id']}: vector contains NaN or Inf")
+                continue
 
-                norm = float(np.linalg.norm(arr))
-                if m["normalization"].lower() == "l2" and abs(norm - 1.0) > 1e-4:
-                    issues.append(f"Chunk {row['chunk_id']}: norm {norm:.6f} != 1.0")
+            norm = float(np.linalg.norm(arr))
+            if abs(norm - 1.0) > 1e-4:
+                non_unit_vectors += 1
+                issues.append(f"Chunk {row['chunk_id']}: vector norm {norm:.6f} != 1.0")
 
-                # Freshness check: current chunk text SHA vs stored text_sha256
-                current_emb_text = build_embedding_text(row["display_text"], passage_tpl)
-                expected_sha = compute_text_sha256(current_emb_text)
-                if row["text_sha256"] != expected_sha:
-                    stale_embeddings += 1
+            expected_text = build_embedding_input(row["display_text"], passage_tpl, model_max_tokens)
+            expected_sha = compute_text_sha256(expected_text)
+            if row["text_sha256"] != expected_sha:
+                stale_embeddings += 1
 
-            # 2. Check for orphan embeddings (chunk_id not in chunks)
-            cur_orphans = self.conn.execute(
-                """
-                SELECT COUNT(*) FROM chunk_embeddings
-                WHERE model_id = ? AND chunk_id NOT IN (SELECT id FROM chunks)
-                """,
-                (m_id,),
-            )
-            orphan_count = cur_orphans.fetchone()[0]
-            if orphan_count > 0:
-                issues.append(f"Found {orphan_count} orphan embeddings for model {m_id}")
+        if stale_embeddings > 0:
+            issues.append(f"Found {stale_embeddings} stale chunk embeddings (text/template mismatch)")
 
-            # 3. Check ready document chunk parity
-            cur_states = self.conn.execute(
-                """
-                SELECT document_id, embedded_chunks, total_chunks
-                FROM semantic_state
-                WHERE model_id = ? AND status = 'READY'
-                """,
-                (m_id,),
-            )
-            for s in cur_states.fetchall():
-                if s["embedded_chunks"] != s["total_chunks"]:
-                    issues.append(
-                        f"Doc {s['document_id']}: READY status but embedded_chunks ({s['embedded_chunks']}) != total_chunks ({s['total_chunks']})"
-                    )
+        cur_orphans = self.conn.execute(
+            "SELECT COUNT(*) FROM chunk_embeddings WHERE model_id = ? AND chunk_id NOT IN (SELECT id FROM chunks)",
+            (target_model,),
+        )
+        orphan_count = cur_orphans.fetchone()[0]
+        if orphan_count > 0:
+            issues.append(f"Found {orphan_count} orphan embeddings for model {target_model}")
+
+        matrix_mib = round((embeddings_present * dim * 4) / (1024 * 1024), 2)
+        all_healthy = (
+            len(issues) == 0
+            and missing_embeddings == 0
+            and stale_embeddings == 0
+            and invalid_blob == 0
+            and nan_inf_count == 0
+            and non_unit_vectors == 0
+        )
+        semantic_ready = all_healthy and (documents_ready == total_documents and total_documents > 0)
 
         return {
-            "all_healthy": len(issues) == 0 and stale_embeddings == 0,
-            "models_checked": len(target_models),
-            "vectors_checked": vectors_checked,
+            "all_healthy": all_healthy,
+            "semantic_ready": semantic_ready,
+            "model_id": target_model,
+            "model_name": m["model_name"],
+            "dimension": dim,
+            "chunks_expected": chunks_expected,
+            "embeddings_present": embeddings_present,
+            "missing_embeddings": missing_embeddings,
             "stale_embeddings": stale_embeddings,
+            "invalid_blob": invalid_blob,
+            "nan_inf_count": nan_inf_count,
+            "non_unit_vectors": non_unit_vectors,
+            "documents_ready": documents_ready,
+            "total_documents": total_documents,
+            "matrix_mib": matrix_mib,
             "issues_count": len(issues),
             "issues": issues[:10],
         }
