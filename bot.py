@@ -179,6 +179,7 @@ async def cmd_start(message: types.Message):
         "• Для точного пошуку фрази візьміть її в лапки: <code>«бабуїни працюють чотири години»</code>\n\n"
         "📚 <b>Команди:</b>\n"
         "/ask &lt;питання&gt; — смисловий пошук думок (семантичний Question Retrieval)\n"
+        "/answer &lt;питання&gt; — обґрунтована відповідь за книгами (Experimental Engine)\n"
         "/books — список усіх книг у бібліотеці\n"
         "/status — стан та статистика бази даних\n"
         "/help — довідка та поради з пошуку",
@@ -192,15 +193,17 @@ async def cmd_help(message: types.Message):
         return
 
     await message.answer(
-        "📖 <b>Поради з пошуку в KORZ:</b>\n\n"
+        "📖 <b>Поради з пошуку та роботи з KORZ:</b>\n\n"
         "1. <b>Лексичний пошук (FTS5 / BM25):</b>\n"
         "Надішліть ключові слова через пробіл: <code>бабуїни соціальний стрес</code>\n\n"
         "2. <b>Точний пошук фрази (Exact Match):</b>\n"
         "Візьміть фразу в лапки: <code>«структурний диференціал»</code>\n\n"
         "3. <b>Смисловий пошук думок (/ask):</b>\n"
-        "Задайте питання або ідею людською мовою: <code>/ask Чому забезпечене життя не усуває стрес?</code>\n"
+        "Задайте питання людською мовою: <code>/ask Чому забезпечене життя не усуває стрес?</code>\n"
         "Бот знайде уривки за схожістю змісту, навіть якщо слова повністю відрізняються.\n\n"
-        "4. <b>Контекст та оцінка:</b>\n"
+        "4. <b>Обґрунтована відповідь (/answer):</b>\n"
+        "Сформувати синтезовану відповідь із точними цитатами: <code>/answer Чому соціальний статус впливає на здоров'я?</code>\n\n"
+        "5. <b>Контекст та оцінка:</b>\n"
         "Під кожним знайденим уривком є <b>[📖 Контекст]</b> та <b>[🎯 Саме цей]</b>.",
         parse_mode=ParseMode.HTML,
     )
@@ -426,6 +429,118 @@ async def cmd_ask(message: types.Message):
         logger.exception(f"Error handling /ask query: '{question}'")
         await message.answer(
             "❌ Сталася помилка під час обробки смислового запиту. Спробуйте пізніше або переформулюйте.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+@dp.message(Command("answer"))
+async def cmd_answer(message: types.Message):
+    if not await check_auth_or_reject(message):
+        return
+
+    # Check feature flag
+    if not lib.config.answer_enabled:
+        await message.answer(
+            "⚠️ <b>Режим /answer наразі вимкнено (Experimental Phase).</b>\n\n"
+            "Цей режим формує вичерпну відповідь на основі уривків із книг (Extractive / Grounded LLM).\n\n"
+            "Щоб активувати його, додайте у файл <code>.env</code>:\n"
+            "<code>KORZ_ANSWER_ENABLED=1</code>\n\n"
+            "Та перезапустіть бота.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    raw_text = message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "📚 <b>Як користуватися режимом /answer (Grounded Answer Engine):</b>\n\n"
+            "Введіть питання, на яке хочете отримати обґрунтовану відповідь за книгами:\n"
+            "• <code>/answer Чому соціальний статус впливає на здоров'я?</code>\n"
+            "• <code>/answer Як Фреско пояснює відмову від грошей?</code>\n"
+            "• <code>/answer Чому слова не можуть повністю описати реальність?</code>\n\n"
+            "💡 <i>KORZ знайде відповідні місця у книгах і сформує відповідь із точними посиланнями на сторінки та цитати.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    question = parts[1].strip()
+    if len(question) > MAX_QUERY_LENGTH:
+        await message.answer(
+            f"⚠️ <b>Питання занадто довге</b> ({len(question)} символів).\n"
+            f"Максимальна дозволена довжина: {MAX_QUERY_LENGTH} символів.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        t0 = time.perf_counter()
+        res = lib.answer(question)
+        latency = (time.perf_counter() - t0) * 1000
+
+        if res.insufficient_info:
+            clean_ans = html.escape(res.answer_text)
+            await message.answer(
+                f"⚠️ <b>{clean_ans}</b>\n\n"
+                "💡 <i>Спробуйте переформулювати запитання або уточнити контекст.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        clean_q = html.escape(question)
+        mode_badge = "Extractive (буквальні цитати)" if res.mode == "extractive" else "Generative LLM"
+        header = (
+            f"📚 <b>Відповідь за бібліотекою KORZ:</b>\n"
+            f"<i>(«{clean_q}» | {mode_badge} | {latency:.0f} ms)</i>\n\n"
+        )
+        body = html.escape(res.answer_text)
+
+        sources_lines = ["\n\n────────────────────────\n<b>📖 Використані джерела:</b>"]
+        kb_buttons = []
+        for s in res.sources:
+            author_str = f"{html.escape(s.author)} — " if s.author else ""
+            title_str = html.escape(s.title)
+            sources_lines.append(
+                f"• [{s.citation_index}] <b>{author_str}{title_str}</b>, стор. <b>{s.page}</b> (абзац {s.paragraph_index})"
+            )
+            kb_buttons.append([
+                InlineKeyboardButton(
+                    text=f"📖 Джерело [{s.citation_index}] (стор. {s.page})",
+                    callback_data=f"ctx:{s.paragraph_id}:2",
+                ),
+                InlineKeyboardButton(
+                    text=f"🎯 Саме цей [{s.citation_index}]",
+                    callback_data=f"fb:tgt:{s.paragraph_id}",
+                ),
+            ])
+
+        full_msg = header + body + "\n".join(sources_lines)
+        chunks = split_telegram_message(full_msg)
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+        for i, chunk in enumerate(chunks):
+            chunk_kb = kb if i == len(chunks) - 1 else None
+            await message.answer(chunk, reply_markup=chunk_kb, parse_mode=ParseMode.HTML)
+
+        fb_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="👍 Відповідь точна",
+                        callback_data=f"fb:up:{res.sources[0].paragraph_id if res.sources else 0}",
+                    ),
+                    InlineKeyboardButton(
+                        text="👎 Не те",
+                        callback_data="fb:dn:0",
+                    ),
+                ]
+            ]
+        )
+        await message.answer("💡 <i>Оцініть повноту та точність сформованої відповіді:</i>", reply_markup=fb_kb, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.exception(f"Error handling /answer query: '{question}'")
+        await message.answer(
+            "❌ Сталася помилка під час формування відповіді. Спробуйте пізніше або змініть формулювання.",
             parse_mode=ParseMode.HTML,
         )
 

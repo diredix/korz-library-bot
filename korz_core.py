@@ -59,6 +59,9 @@ class KorzConfig:
     shadow_enabled: bool = field(
         default_factory=lambda: os.environ.get("KORZ_SHADOW_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     )
+    answer_enabled: bool = field(
+        default_factory=lambda: os.environ.get("KORZ_ANSWER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    )
     fts_engine_version: str = "sqlite-fts5-bm25-v1.1"
 
     @classmethod
@@ -69,6 +72,7 @@ class KorzConfig:
         backups_dir = data_dir / "backups"
         semantic_enabled = os.environ.get("KORZ_SEMANTIC_ENABLED", "0").strip().lower() in ("1", "true", "yes")
         shadow_enabled = os.environ.get("KORZ_SHADOW_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+        answer_enabled = os.environ.get("KORZ_ANSWER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
         return cls(
             data_dir=data_dir,
             db_path=db_path,
@@ -76,6 +80,7 @@ class KorzConfig:
             backups_dir=backups_dir,
             semantic_enabled=semantic_enabled,
             shadow_enabled=shadow_enabled,
+            answer_enabled=answer_enabled,
         )
 
 
@@ -1741,6 +1746,21 @@ class KorzLibrary:
             pass
 
         return results
+
+    def answer(
+        self,
+        question: str,
+        mode: Optional[str] = None,
+        limit: Optional[int] = None,
+        doc_id: Optional[str] = None,
+    ) -> Any:
+        """
+        Execute Grounded Answering over book library using AnswerEngine.
+        Delegates to extractive or generative answerer based on configuration.
+        """
+        from korz_answer import AnswerEngine
+        engine = AnswerEngine(self)
+        return engine.answer(question, mode=mode, limit=limit, doc_id=doc_id)
 
     def _search_exact(self, phrase: str, limit: int = 10, doc_id: Optional[str] = None) -> List[SearchResult]:
         """Exact case-insensitive literal substring search."""

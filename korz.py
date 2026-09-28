@@ -160,6 +160,47 @@ def cmd_ask(args, lib: KorzLibrary) -> None:
         print(f"\n❌ {e}\n")
 
 
+def cmd_answer(args, lib: KorzLibrary) -> None:
+    question = args.question.strip() if args.question else ""
+    if not question:
+        print("❌ Помилка: вкажіть питання.")
+        print("   Приклад: python korz.py answer \"чому соціальний статус впливає на здоров'я?\"")
+        return
+
+    mode = getattr(args, "mode", None)
+    limit = getattr(args, "limit", None)
+    doc_id = getattr(args, "doc", None)
+
+    try:
+        from korz_answer import AnswerEngine, AnswerConfig
+        cfg = AnswerConfig.from_env()
+        cfg.enabled = True
+        engine = AnswerEngine(lib, cfg)
+        res = engine.answer(question, mode=mode, limit=limit, doc_id=doc_id)
+
+        print("\n" + "=" * 65)
+        mode_label = "Extractive (буквальні цитати)" if res.mode == "extractive" else "Generative LLM (зв'язна відповідь)"
+        print(f"📚 KORZ Answer Engine [{mode_label}] ({res.latency_ms:.1f} ms)")
+        print("=" * 65)
+        print(f"❓ Питання: «{question}»\n" + "─" * 65)
+
+        if res.insufficient_info:
+            print(f"\n⚠️  {res.answer_text}\n")
+            print("=" * 65 + "\n")
+            return
+
+        print(f"\n{res.answer_text}\n")
+        print("─" * 65)
+        print("📖 Використані джерела з бібліотеки:")
+        for s in res.sources:
+            author_str = f"{s.author} — " if s.author else ""
+            print(f"  [{s.citation_index}] 📚 {author_str}«{s.title}», стор. {s.page} (абзац {s.paragraph_index}) [ID: {s.paragraph_id}]")
+
+        print("=" * 65 + "\n")
+    except Exception as e:
+        print(f"\n❌ Помилка формування відповіді: {e}\n")
+
+
 def cmd_show(args, lib: KorzLibrary) -> None:
     par_id = args.id
     ctx = lib.get_context(par_id, window=args.context)
@@ -649,6 +690,18 @@ def main() -> None:
     p_ask.add_argument("--limit", "-n", type=int, default=5, help="Кількість результатів (за замовчуванням: 5)")
     p_ask.add_argument("--doc", help="Фільтр за ID книги")
 
+    # answer (Grounded Answering Engine)
+    p_ans = subparsers.add_parser("answer", help="Сформувати обґрунтовану відповідь на питання на основі книг бібліотеки")
+    p_ans.add_argument("question", help="Питання до бібліотеки")
+    p_ans.add_argument(
+        "--mode",
+        choices=["extractive", "generative", "auto"],
+        default="auto",
+        help="Режим відповіді: extractive (буквальні цитати), generative (локальна LLM) або auto",
+    )
+    p_ans.add_argument("--limit", "-n", type=int, default=5, help="Кількість уривків-кандидатів (за замовчуванням: 5)")
+    p_ans.add_argument("--doc", help="Фільтр за ID книги")
+
     # show
     p_show = subparsers.add_parser("show", help="Показати абзац та розширений контекст")
     p_show.add_argument("id", type=int, help="ID абзацу (paragraph_id)")
@@ -743,6 +796,8 @@ def main() -> None:
             cmd_search(args, lib)
         elif args.command == "ask":
             cmd_ask(args, lib)
+        elif args.command == "answer":
+            cmd_answer(args, lib)
         elif args.command == "show":
             cmd_show(args, lib)
         elif args.command == "books":
