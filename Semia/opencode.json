@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "read": {
+      "*": "allow",
+      "**/.env": "deny",
+      "**/*.env": "deny",
+      "**/token*": "deny"
+    },
+    "bash": {
+      "*": "deny",
+      "*korz_qdrant.py*": "allow"
+    },
+    "edit": "deny",
+    "write": "deny",
+    "task": "deny",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "question": "deny",
+    "todowrite": "deny",
+    "lsp": "deny"
+  }
+}

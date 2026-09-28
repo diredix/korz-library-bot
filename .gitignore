@@ -1,0 +1,32 @@
+# Secrets & Environment variables
+.env
+.env.*
+*.token
+secrets.json
+
+# SQLite Databases & Storage
+data/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & temp files
+*.log
+*.bak
+debug_*.py
+temp_*/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
