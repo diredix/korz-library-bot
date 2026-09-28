@@ -657,6 +657,207 @@ def cmd_shadow_replay(args, lib: KorzLibrary) -> None:
     print(f"  Index SHA:               {res['index_sha']}\n")
 
 
+def cmd_corpus_audit(args) -> None:
+    from korz_corpus import CorpusAuditor
+    target = Path(args.path)
+    if not target.exists():
+        print(f"❌ Помилка: шлях не знайдено: '{args.path}'")
+        return
+
+    auditor = CorpusAuditor()
+    report = auditor.audit_path(target)
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        return
+
+    print("\n" + "=" * 65)
+    print(f"📚 KORZ Corpus Audit Report: {target.name}")
+    print("=" * 65)
+    print(f"Файлів проскановано:         {report.total_files:,}".replace(",", " "))
+    print(f"Загальна кількість рядків:   {report.total_lines:,}".replace(",", " "))
+    print(f"Загальна кількість символів: {report.total_chars:,}".replace(",", " "))
+    print(f"Розділювачів сторінок:       {report.page_separators:,}".replace(",", " "))
+    print("\nВиявлений типографічний та OCR-шум:")
+    print("─" * 65)
+    print(f"• Розділювачі сторінок (Datalab):     {report.page_separators:,}".replace(",", " "))
+    print(f"• Одинокі номери сторінок:             {report.standalone_numbers:,}".replace(",", " "))
+    print(f"• Повторювані колонтитули:            {report.running_headers:,}".replace(",", " "))
+    print(f"• Маркери зображень Markdown:          {report.image_markers:,}".replace(",", " "))
+    print(f"• Дублікати підписів ілюстрацій:        {report.duplicate_captions:,}".replace(",", " "))
+    print(f"• Розірвані речення на стиках:          {report.broken_sentences:,}".replace(",", " "))
+    print(f"• Нестандартні Unicode-символи:         {report.unicode_anomalies:,}".replace(",", " "))
+
+    print("\nГрупування за рівнем впевненості:")
+    print(f"• HIGH confidence (безпечно для очищення):    {report.high_confidence_noise:,}".replace(",", " "))
+    print(f"• MEDIUM confidence (потребує перевірки):         {report.medium_confidence_noise:,}".replace(",", " "))
+    print(f"• REVIEW manually (підозрілі випадки):            {report.review_noise:,}".replace(",", " "))
+
+    if report.sample_items:
+        print("\nЗразки виявленого шуму (перші 5):")
+        for item in report.sample_items[:5]:
+            pg_str = f"стор. {item.page_number}, " if item.page_number else ""
+            print(f"  [{item.confidence}] ряд. {item.line_number} ({pg_str}{item.category}): {repr(item.raw_text[:60])}")
+
+    print("=" * 65 + "\n")
+
+
+def cmd_corpus_clean(args) -> None:
+    from korz_corpus import CorpusCleaner, CorpusVerifier
+    target = Path(args.path)
+    if not target.exists():
+        print(f"❌ Помилка: шлях не знайдено: '{args.path}'")
+        return
+
+    dry_run = not getattr(args, "apply", False)
+    out_dir = Path(args.out) if getattr(args, "out", None) else Path("data/corpus_clean")
+
+    if target.is_file():
+        files = [target]
+    else:
+        files = [f for f in target.rglob("*.md") if not f.name.endswith(".bak") and not f.name.endswith(".cleaned.md")]
+
+    if not files:
+        print(f"❌ Файлів Markdown для очищення не знайдено у '{args.path}'")
+        return
+
+    print("\n" + "=" * 65)
+    mode_str = "DRY-RUN (симуляція без зміни файлів)" if dry_run else f"APPLY (збереження до {out_dir})"
+    print(f"🧹 KORZ Corpus Cleaner [{mode_str}]")
+    print("=" * 65)
+
+    frequent = CorpusCleaner.discover_frequent_headers(files)
+    if frequent:
+        print(f"• Виявлено повторюваних колонтитулів корпусу: {len(frequent)}")
+
+    cleaner = CorpusCleaner(frequent_headers=frequent)
+    verifier = CorpusVerifier()
+
+    total_orig_chars = 0
+    total_clean_chars = 0
+    total_items = {}
+
+    for f in files:
+        if dry_run:
+            diff = cleaner.clean_file(f, dry_run=True)
+            out_file = None
+        else:
+            rel = f.name
+            out_file = out_dir / target.name / rel if target.is_dir() else out_dir / rel
+            diff = cleaner.clean_file(f, dry_run=False, output_path=out_file)
+
+        total_orig_chars += diff.original_chars
+        total_clean_chars += diff.cleaned_chars
+        for cat, cnt in diff.items_removed_by_category.items():
+            total_items[cat] = total_items.get(cat, 0) + cnt
+
+        print(f"📄 {f.name}: {diff.original_lines} -> {diff.cleaned_lines} рядків | -{diff.removed_chars} симв. (-{diff.removal_ratio_pct:.2f}%)")
+        if dry_run and len(files) == 1 and diff.diff_text:
+            print("\n--- DIFF SAMPLE ---")
+            lines = diff.diff_text.splitlines()[:35]
+            print("\n".join(lines))
+            if len(diff.diff_text.splitlines()) > 35:
+                print("... [diff скорочено]")
+
+    diff_total = total_orig_chars - total_clean_chars
+    ratio_total = (diff_total / total_orig_chars * 100) if total_orig_chars > 0 else 0.0
+
+    print("─" * 65)
+    print("📊 ПІДСУМОК ОЧИЩЕННЯ:")
+    print(f"• Оброблено файлів:             {len(files)}")
+    print(f"• Загальний обсяг до:           {total_orig_chars:,} симв.".replace(",", " "))
+    print(f"• Загальний обсяг після:        {total_clean_chars:,} симв.".replace(",", " "))
+    print(f"• Видалено шуму:                {diff_total:,} симв. ({ratio_total:.2f}%)".replace(",", " "))
+    print("• Видалено за категоріями:")
+    for cat, cnt in total_items.items():
+        if cnt > 0:
+            print(f"    - {cat}: {cnt:,}".replace(",", " "))
+
+    # Text loss gate verification
+    ver = verifier.verify("x" * total_orig_chars, "x" * total_clean_chars, total_items)
+    status_emoji = "✅" if ver.is_safe else "❌"
+    print(f"\n{status_emoji} Text-Loss Safety Gate: [{ver.status}] (некласифікована втрата: {ver.unclassified_loss_pct:.2f}%)")
+    for note in ver.notes:
+        print(f"   ℹ️  {note}")
+
+    if dry_run:
+        print("\n💡 Це була симуляція. Щоб застосувати очищення, виконайте:")
+        print(f"   python korz.py corpus clean \"{args.path}\" --apply\n")
+    else:
+        print(f"\n✓ Очищені файли збережено у: {out_dir}\n")
+
+
+def cmd_corpus_verify(args) -> None:
+    from korz_corpus import CorpusVerifier, CorpusCleaner
+    orig_p = Path(args.original)
+    clean_p = Path(args.cleaned)
+    if not orig_p.exists() or not clean_p.exists():
+        print(f"❌ Помилка: один із файлів не знайдено.")
+        return
+
+    with open(orig_p, "r", encoding="utf-8", errors="replace") as f: orig_txt = f.read()
+    with open(clean_p, "r", encoding="utf-8", errors="replace") as f: clean_txt = f.read()
+
+    # Re-clean to gather deterministic stats
+    cleaner = CorpusCleaner()
+    _, stats = cleaner.clean_text(orig_txt)
+    verifier = CorpusVerifier()
+    res = verifier.verify(orig_txt, clean_txt, stats)
+
+    print("\n" + "=" * 65)
+    print(f"🛡️  KORZ Text-Loss Safety Gate Verification")
+    print("=" * 65)
+    print(f"Оригінальний файл:  {orig_p.name} ({res.original_chars:,} симв.)".replace(",", " "))
+    print(f"Очищений файл:      {clean_p.name} ({res.cleaned_chars:,} симв.)".replace(",", " "))
+    print(f"Різниця:            -{res.deleted_chars:,} симв. (-{res.deletion_ratio_pct:.2f}%)".replace(",", " "))
+    print(f"Некласифікована втрата: {res.unclassified_loss_chars:,} симв. ({res.unclassified_loss_pct:.2f}%)".replace(",", " "))
+
+    status_icon = "✅" if res.is_safe else "❌"
+    print(f"\nСтатус безпеки: {status_icon} [{res.status}]")
+    for note in res.notes:
+        print(f"• {note}")
+    print("=" * 65 + "\n")
+
+
+def cmd_corpus_report(args) -> None:
+    from korz_corpus import CorpusAuditor
+    books_dirs = [
+        "Robert_Sapolsky_A_Primates_Memoir_2002_Pages_1-308",
+        "Alfred_Korzybski_Science_and_Sanity_1948_UA",
+        "Jacque_Fresco_Looking_Forward_Pages_1-121",
+        "Jacque_Fresco_Future_Design_2007_Pages_1-79",
+        "Jacque_Fresco_The_Best_That_Money_Cant_Buy_2002_Pages_180",
+    ]
+
+    print("\n" + "=" * 75)
+    print("📚 KORZ CORPUS QUALITY OVERVIEW (Усі 5 книг бібліотеки)")
+    print("=" * 75)
+
+    total_lines = 0
+    total_chars = 0
+    total_noise = 0
+    auditor = CorpusAuditor()
+
+    print(f"{'Книга':<37} | {'Стор.':<6} | {'Рядків':<7} | {'Сміття (HIGH)':<12}")
+    print("─" * 75)
+
+    for b in books_dirs:
+        p = Path(b)
+        if not p.exists():
+            continue
+        rep = auditor.audit_path(p)
+        total_lines += rep.total_lines
+        total_chars += rep.total_chars
+        total_noise += rep.high_confidence_noise
+        short_name = b.split("_Pages")[0].replace("_", " ")[:35]
+        print(f"{short_name:<37} | {rep.page_separators:<6} | {rep.total_lines:<7} | {rep.high_confidence_noise:<12}")
+
+    print("─" * 75)
+    print(f"{'РАЗОМ ПО БІБЛІОТЕЦІ:':<37} | {'-':<6} | {total_lines:<7} | {total_noise:<12}")
+    print(f"\nЗагалом виявлено {total_noise:,} елементів типографічного та OCR-шуму.".replace(",", " "))
+    print("Виконайте 'python korz.py corpus clean <каталог> --dry-run' для перегляду diff.\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="korz",
@@ -785,6 +986,26 @@ def main() -> None:
 
     shadow_sub.add_parser("status", help="Коротка статистика збережених тіньових запитів та відгуків")
 
+    # corpus (Corpus Quality Pipeline)
+    p_corp = subparsers.add_parser("corpus", help="KORZ Corpus Quality Pipeline (аудит, очищення OCR та валідація текстів)")
+    corp_sub = p_corp.add_subparsers(dest="corpus_command")
+
+    p_corp_audit = corp_sub.add_parser("audit", help="Аудит файлу або папки на наявність OCR-сміття, колонтитулів та номерів сторінок")
+    p_corp_audit.add_argument("path", help="Шлях до файлу .md або папки з книгами")
+    p_corp_audit.add_argument("--json", action="store_true", help="Вивести звіт у форматі JSON")
+
+    p_corp_clean = corp_sub.add_parser("clean", help="Очистити файл або папку від OCR-сміття (з підтримкою --dry-run та --apply)")
+    p_corp_clean.add_argument("path", help="Шлях до файлу або каталогу для очищення")
+    p_corp_clean.add_argument("--dry-run", action="store_true", help="Показати diff без зміни файлів")
+    p_corp_clean.add_argument("--apply", action="store_true", help="Застосувати очищення та зберегти файли")
+    p_corp_clean.add_argument("--out", help="Каталог для збереження очищених файлів (за замовчуванням: data/corpus_clean/)")
+
+    p_corp_verify = corp_sub.add_parser("verify-clean", help="Перевірити безпечність очищення (Text-Loss Safety Gate)")
+    p_corp_verify.add_argument("original", help="Шлях до оригінального файлу")
+    p_corp_verify.add_argument("cleaned", help="Шлях до очищеного файлу")
+
+    corp_sub.add_parser("report", help="Підсумковий звіт аудиту якості всіх книг корпусу")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -850,6 +1071,17 @@ def main() -> None:
                 cmd_shadow_status(args, lib)
             else:
                 p_shadow.print_help()
+        elif args.command == "corpus":
+            if args.corpus_command == "audit":
+                cmd_corpus_audit(args)
+            elif args.corpus_command == "clean":
+                cmd_corpus_clean(args)
+            elif args.corpus_command == "verify-clean":
+                cmd_corpus_verify(args)
+            elif args.corpus_command == "report":
+                cmd_corpus_report(args)
+            else:
+                p_corp.print_help()
     finally:
         lib.close()
 
