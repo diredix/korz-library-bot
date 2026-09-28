@@ -83,6 +83,30 @@ class TestBotHardening(unittest.TestCase):
         oversized_query = "а" * (MAX_QUERY_LENGTH + 50)
         self.assertGreater(len(oversized_query), MAX_QUERY_LENGTH)
 
+    def test_handle_query_search_and_render(self):
+        """Verify handle_query executes search, formats results safely without exceptions."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import bot
+        from korz_core import KorzLibrary
+
+        with KorzLibrary() as library:
+            bot.lib = library
+            for query in ["поведінка", "тривога"]:
+                mock_msg = MagicMock()
+                mock_msg.from_user.id = 12345
+                mock_msg.text = query
+                mock_msg.answer = AsyncMock()
+
+                asyncio.run(bot.handle_query(mock_msg))
+                self.assertGreaterEqual(mock_msg.answer.call_count, 2)
+                sent_texts = [call[0][0] for call in mock_msg.answer.call_args_list]
+                self.assertFalse(
+                    any("Сталася помилка під час обробки пошуку" in t for t in sent_texts),
+                    f"Search failed for '{query}'"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
+
