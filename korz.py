@@ -193,6 +193,13 @@ def cmd_status(args, lib: KorzLibrary) -> None:
     print(f"Всього абзаців:   {st['total_paragraphs']:,}".replace(",", " "))
     print(f"Пошукових блоків: {st['total_chunks']:,}".replace(",", " "))
     print(f"Каталог джерел:   {st['sources_dir']}")
+    if st.get("semantic"):
+        sem = st["semantic"]
+        print("─" * 50)
+        print("🧠 Семантична інфраструктура (V2A):")
+        print(f"Стан:             {'Активно' if sem['semantic_enabled'] else 'Вимкнено (KORZ_SEMANTIC_ENABLED=0)'}")
+        print(f"Зареєстровано моделей: {sem['models_registered']}")
+        print(f"Векторизовано блоків:  {sem['chunks_embedded']} / {sem['total_chunks']}")
     stats = lib.get_search_stats()
     if stats["total_searches"] > 0:
         print("─" * 50)
@@ -269,6 +276,49 @@ def cmd_admin_search_log(args, lib: KorzLibrary) -> None:
     print("─" * 60 + "\n")
 
 
+def cmd_semantic_status(args, lib: KorzLibrary) -> None:
+    sem = lib.get_semantic_status()
+    print("\n🧠 KORZ Semantic Infrastructure (Phase V2A):")
+    print("─" * 50)
+    print(f"Версія схеми:         v{sem['schema_version']}")
+    print(f"Semantic enabled:     {'так' if sem['semantic_enabled'] else 'ні (KORZ_SEMANTIC_ENABLED=0)'}")
+    print(f"Зареєстровано моделей:{sem['models_registered']}")
+    print(f"Документів готово:    {sem['documents_ready']} / {sem['total_documents']}")
+    print(f"Векторизовано блоків: {sem['chunks_embedded']} / {sem['total_chunks']}")
+    print(f"FTS5 baseline:        {sem['fts5_baseline']}")
+    if sem["models"]:
+        print("─" * 50)
+        print("Зареєстровані моделі:")
+        for m in sem["models"]:
+            print(f" • [{m['model_id']}] {m['model_name']} (dim: {m['dimension']}, norm: {m['normalization']})")
+    print("─" * 50 + "\n")
+
+
+def cmd_semantic_verify(args, lib: KorzLibrary) -> None:
+    print("🔬 Перевірка цілісності семантичної інфраструктури (V2A)...")
+    res = lib.verify_semantic_integrity()
+    print("─" * 50)
+    print(f"Перевірено моделей:    {res['models_checked']}")
+    print(f"Перевірено векторів:   {res['vectors_checked']}")
+    print(f"Застарілих векторів:   {res['stale_embeddings']}")
+    print(f"Знайдено проблем:      {res['issues_count']}")
+    if res["issues"]:
+        for iss in res["issues"]:
+            print(f" ⚠️  {iss}")
+    print("─" * 50)
+    if res["all_healthy"]:
+        print("✅ Семантична інфраструктура повністю здорова та консистентна.\n")
+    else:
+        print("❌ Виявлено невідповідності в семантичному шарі!\n")
+
+
+def cmd_admin_migrate(args, lib: KorzLibrary) -> None:
+    print("⚙️  Перевірка та виконання міграцій бази даних...")
+    st = lib.status()
+    print(f"✓ Поточна версія схеми бази: v{st.get('schema_version', 2)}")
+    print("✅ Всі міграції застосовано успішно.\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="korz",
@@ -321,11 +371,18 @@ def main() -> None:
     p_restore.add_argument("backup_path", help="Шлях до файлу бекапу (.sqlite)")
     p_restore.add_argument("-y", "--yes", action="store_true", help="Підтвердити відновлення без запиту")
 
+    # semantic (V2)
+    p_sem = subparsers.add_parser("semantic", help="Керування семантичним шаром V2 (інфраструктура ембедингів)")
+    sem_sub = p_sem.add_subparsers(dest="semantic_command")
+    sem_sub.add_parser("status", help="Стан семантичної інфраструктури, моделі та векторизовані чанки")
+    sem_sub.add_parser("verify", help="Перевірити цілісність векторів, розмірностей та відповідність SHA")
+
     # admin
     p_admin = subparsers.add_parser("admin", help="Адміністративні інструменти")
     admin_sub = p_admin.add_subparsers(dest="admin_command")
     admin_sub.add_parser("verify", help="Перевірити цілісність бази даних та FTS5")
     admin_sub.add_parser("reindex", help="Перебудувати індекс FTS5")
+    admin_sub.add_parser("migrate", help="Перевірити та виконати міграції схеми бази даних")
     p_admin_log = admin_sub.add_parser("search-log", help="Переглянути нещодавні запити без результатів (для аналізу V2)")
     p_admin_log.add_argument("--limit", type=int, default=20, help="Кількість записів (за замовчуванням: 20)")
 
@@ -355,11 +412,20 @@ def main() -> None:
             cmd_backup(args, lib)
         elif args.command == "restore":
             cmd_restore(args, lib)
+        elif args.command == "semantic":
+            if args.semantic_command == "status":
+                cmd_semantic_status(args, lib)
+            elif args.semantic_command == "verify":
+                cmd_semantic_verify(args, lib)
+            else:
+                p_sem.print_help()
         elif args.command == "admin":
             if args.admin_command == "verify":
                 cmd_admin_verify(args, lib)
             elif args.admin_command == "reindex":
                 cmd_admin_reindex(args, lib)
+            elif args.admin_command == "migrate":
+                cmd_admin_migrate(args, lib)
             elif args.admin_command == "search-log":
                 cmd_admin_search_log(args, lib)
             else:

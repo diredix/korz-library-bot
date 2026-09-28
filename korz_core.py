@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
+
 logger = logging.getLogger("korz")
 
 # Default directories
@@ -37,7 +39,7 @@ DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "korz_library.sqlite"
 DEFAULT_SOURCES_DIR = DEFAULT_DATA_DIR / "sources"
 DEFAULT_BACKUPS_DIR = DEFAULT_DATA_DIR / "backups"
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -49,6 +51,9 @@ class KorzConfig:
     max_chunk_chars: int = 1400
     target_chunk_chars: int = 1200
     target_paragraph_chars: int = 1400
+    semantic_enabled: bool = field(
+        default_factory=lambda: os.environ.get("KORZ_SEMANTIC_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    )
 
     @classmethod
     def from_env(cls) -> "KorzConfig":
@@ -56,7 +61,14 @@ class KorzConfig:
         db_path = Path(os.environ.get("KORZ_DB_PATH", str(data_dir / "korz_library.sqlite")))
         sources_dir = data_dir / "sources"
         backups_dir = data_dir / "backups"
-        return cls(data_dir=data_dir, db_path=db_path, sources_dir=sources_dir, backups_dir=backups_dir)
+        semantic_enabled = os.environ.get("KORZ_SEMANTIC_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+        return cls(
+            data_dir=data_dir,
+            db_path=db_path,
+            sources_dir=sources_dir,
+            backups_dir=backups_dir,
+            semantic_enabled=semantic_enabled,
+        )
 
 
 @dataclass
@@ -101,7 +113,7 @@ class SearchResult:
     text: str
     snippet: str
     score: float = 0.0
-    match_type: str = "fts"  # "exact" | "fts"
+    match_type: str = "fts"  # "exact" | "fts" | "semantic" | "hybrid"
 
     # Backward compatibility aliases
     @property
@@ -111,6 +123,90 @@ class SearchResult:
     @property
     def display_text(self) -> str:
         return self.text
+
+
+@dataclass(frozen=True)
+class EmbeddingContract:
+    """Canonical specification of an embedding model configuration."""
+    model_name: str
+    model_revision: Optional[str] = None
+    dimension: int = 1024
+    dtype: str = "float32"
+    normalization: str = "l2"
+    pooling: Optional[str] = "mean"
+    query_template: str = "{text}"
+    passage_template: str = "{text}"
+
+    def to_canonical_dict(self) -> Dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "model_revision": self.model_revision,
+            "dimension": int(self.dimension),
+            "dtype": self.dtype,
+            "normalization": self.normalization.lower(),
+            "pooling": self.pooling.lower() if self.pooling else None,
+            "query_template": self.query_template,
+            "passage_template": self.passage_template,
+        }
+
+    def compute_config_sha256(self) -> str:
+        data = self.to_canonical_dict()
+        canonical_json = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+    def generate_model_id(self) -> str:
+        clean_name = re.sub(r"[^a-zA-Z0-9]+", "-", self.model_name.split("/")[-1].lower()).strip("-")
+        config_hash = self.compute_config_sha256()[:12]
+        return f"emb-{clean_name}-{config_hash}"
+
+
+def build_embedding_text(text: str, template: str = "{text}") -> str:
+    """Build canonical embedding text with deterministic whitespace normalization."""
+    normalized_text = " ".join(text.split())
+    if "{text}" in template:
+        return template.format(text=normalized_text)
+    return normalized_text
+
+
+def compute_text_sha256(embedding_text: str) -> str:
+    """Compute deterministic SHA-256 for chunk embedding caching."""
+    return hashlib.sha256(embedding_text.encode("utf-8")).hexdigest()
+
+
+def vector_to_blob(vector: Any, expected_dim: int, normalize: bool = True) -> bytes:
+    """
+    Convert a vector to float32 little-endian BLOB with optional L2 normalization.
+    Ensures vector is 1D, finite, and strictly matches expected dimension.
+    """
+    arr = np.asarray(vector, dtype=np.float32)
+    if arr.ndim != 1 or arr.shape[0] != expected_dim:
+        raise ValueError(f"Vector dimension mismatch: expected ({expected_dim},), got {arr.shape}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Vector contains non-finite values (NaN or Inf)")
+
+    if normalize:
+        norm = float(np.linalg.norm(arr))
+        if norm > 0:
+            arr = arr / norm
+
+    return arr.tobytes(order="C")
+
+
+def blob_to_vector(blob: bytes, expected_dim: int) -> np.ndarray:
+    """
+    Convert BLOB back to 1D float32 numpy array.
+    Validates byte length and finiteness.
+    """
+    expected_bytes = expected_dim * 4  # 4 bytes per float32
+    if len(blob) != expected_bytes:
+        raise ValueError(
+            f"BLOB size mismatch: expected {expected_bytes} bytes for dim {expected_dim}, got {len(blob)} bytes"
+        )
+
+    arr = np.frombuffer(blob, dtype=np.float32)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Deserialized vector contains non-finite values")
+    return arr
 
 
 # Custom SQLite functions
@@ -148,7 +244,7 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def init_database(conn: sqlite3.Connection) -> None:
+def init_database(conn: sqlite3.Connection, backups_dir: Optional[Path] = None) -> None:
     """Initialize database tables, migrations, FTS5 index, and triggers."""
     cur = conn.execute("PRAGMA user_version;")
     version_row = cur.fetchone()
@@ -156,20 +252,8 @@ def init_database(conn: sqlite3.Connection) -> None:
 
     if current_version < 1:
         _apply_migration_v1(conn)
-    else:
-        # Ensure search_log table exists on existing v1 databases
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS search_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            query TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            result_count INTEGER NOT NULL,
-            top_result_id INTEGER,
-            latency_ms REAL NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_search_log_created ON search_log(created_at);")
+    if current_version < 2:
+        _apply_migration_v2(conn, backups_dir=backups_dir)
 
 
 def _apply_migration_v1(conn: sqlite3.Connection) -> None:
@@ -324,6 +408,113 @@ def _apply_migration_v1(conn: sqlite3.Connection) -> None:
         conn.execute("COMMIT;")
     except Exception:
         conn.execute("ROLLBACK;")
+        raise
+
+
+def _apply_migration_v2(conn: sqlite3.Connection, backups_dir: Optional[Path] = None) -> None:
+    """
+    Apply additive Schema v2 migration:
+      - embedding_models
+      - chunk_embeddings (BLOB float32 vectors)
+      - semantic_state
+    Pre-migration safety: checks integrity and optionally creates pre-migration backup.
+    Post-migration safety: verifies integrity.
+    """
+    # Pre-migration safety checks
+    try:
+        cur_check = conn.execute("PRAGMA quick_check;")
+        res = cur_check.fetchone()[0]
+        if res != "ok":
+            logger.warning(f"Pre-migration quick_check returned: {res}")
+    except Exception as e:
+        logger.warning(f"Pre-migration check exception: {e}")
+
+    # Optional hot snapshot backup before schema upgrade
+    if backups_dir:
+        try:
+            backups_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            backup_file = backups_dir / f"korz_library_pre_v2_migration_{ts}.sqlite"
+            b_conn = sqlite3.connect(str(backup_file))
+            try:
+                conn.backup(b_conn)
+                logger.info(f"Pre-migration v2 backup created: {backup_file}")
+            finally:
+                b_conn.close()
+        except Exception as e:
+            logger.warning(f"Could not create pre-migration backup: {e}")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn.execute("BEGIN IMMEDIATE;")
+    try:
+        # Table 1: Registered embedding models
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS embedding_models (
+            model_id TEXT PRIMARY KEY,
+            model_name TEXT NOT NULL,
+            model_revision TEXT,
+            dimension INTEGER NOT NULL CHECK (dimension > 0),
+            dtype TEXT NOT NULL DEFAULT 'float32',
+            normalization TEXT NOT NULL,
+            pooling TEXT,
+            query_template TEXT,
+            passage_template TEXT,
+            config_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """)
+
+        # Table 2: Chunk embeddings
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunk_embeddings (
+            chunk_id INTEGER NOT NULL,
+            model_id TEXT NOT NULL,
+            text_sha256 TEXT NOT NULL,
+            vector BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chunk_id, model_id),
+            FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE,
+            FOREIGN KEY (model_id) REFERENCES embedding_models(model_id) ON DELETE RESTRICT
+        );
+        """)
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_model ON chunk_embeddings(model_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_sha ON chunk_embeddings(text_sha256);")
+
+        # Table 3: Document semantic indexing progress
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS semantic_state (
+            document_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('PENDING', 'INDEXING', 'READY', 'STALE', 'FAILED')),
+            total_chunks INTEGER NOT NULL DEFAULT 0,
+            embedded_chunks INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (document_id, model_id),
+            FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+            FOREIGN KEY (model_id) REFERENCES embedding_models(model_id) ON DELETE CASCADE
+        );
+        """)
+
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_migrations (version, applied_at, description) VALUES (?, ?, ?)",
+            (2, now_iso, "v2 additive semantic schema: embedding_models, chunk_embeddings, semantic_state"),
+        )
+        conn.execute("PRAGMA user_version = 2;")
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+
+    # Post-migration sanity check
+    try:
+        cur_post = conn.execute("PRAGMA quick_check;")
+        res_post = cur_post.fetchone()[0]
+        if res_post != "ok":
+            raise RuntimeError(f"Post-migration quick_check failed: {res_post}")
+    except Exception as e:
+        logger.error(f"Post-migration check error: {e}")
         raise
 
 
@@ -762,7 +953,7 @@ class KorzLibrary:
     def __init__(self, config: Optional[KorzConfig] = None):
         self.config = config or KorzConfig.from_env()
         self.conn = get_connection(self.config.db_path)
-        init_database(self.conn)
+        init_database(self.conn, backups_dir=self.config.backups_dir)
 
     def close(self) -> None:
         """Close SQLite database connection."""
@@ -1063,6 +1254,12 @@ class KorzLibrary:
             return []
 
         clean_q = query.strip()
+        if mode == "semantic":
+            raise NotImplementedError(
+                "Semantic retrieval is in development (Phase V2A infrastructure complete). "
+                "Semantic search will be activated in Phase V2B. Active modes: 'auto', 'exact', 'fts'."
+            )
+
         t0 = time.perf_counter()
 
         # If mode is exact, or auto with explicit quotes
@@ -1397,6 +1594,8 @@ class KorzLibrary:
         cur_chunks = self.conn.execute("SELECT COUNT(*) FROM chunks")
         chunks_count = cur_chunks.fetchone()[0]
 
+        semantic_info = self.get_semantic_status() if schema_version >= 2 else None
+
         return {
             "database_path": str(db_file),
             "database_size_mb": db_size_mb,
@@ -1407,6 +1606,7 @@ class KorzLibrary:
             "total_chunks": chunks_count,
             "sources_dir": str(self.config.sources_dir),
             "backups_dir": str(self.config.backups_dir),
+            "semantic": semantic_info,
         }
 
     def backup(self, dest_path: Optional[Union[str, Path]] = None) -> str:
@@ -1556,4 +1756,265 @@ class KorzLibrary:
             return [dict(r) for r in cur.fetchall()]
         except Exception:
             return []
+
+    # =========================================================================
+    # Phase V2A: Semantic Infrastructure & Embedding Storage APIs
+    # =========================================================================
+
+    def register_embedding_model(self, contract: EmbeddingContract) -> str:
+        """Register an embedding model contract in embedding_models table."""
+        model_id = contract.generate_model_id()
+        config_sha = contract.compute_config_sha256()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO embedding_models (
+                    model_id, model_name, model_revision, dimension, dtype,
+                    normalization, pooling, query_template, passage_template,
+                    config_sha256, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    model_id,
+                    contract.model_name,
+                    contract.model_revision,
+                    contract.dimension,
+                    contract.dtype,
+                    contract.normalization,
+                    contract.pooling,
+                    contract.query_template,
+                    contract.passage_template,
+                    config_sha,
+                    now_iso,
+                ),
+            )
+        return model_id
+
+    def get_embedding_model(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch details of a registered embedding model."""
+        cur = self.conn.execute("SELECT * FROM embedding_models WHERE model_id = ?", (model_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_embedding_models(self) -> List[Dict[str, Any]]:
+        """List all registered embedding models."""
+        cur = self.conn.execute("SELECT * FROM embedding_models ORDER BY created_at ASC")
+        return [dict(r) for r in cur.fetchall()]
+
+    def delete_embedding_model(self, model_id: str) -> None:
+        """
+        Delete an embedding model.
+        Raises sqlite3.IntegrityError if vectors exist referencing this model (ON DELETE RESTRICT).
+        """
+        with self.conn:
+            self.conn.execute("DELETE FROM embedding_models WHERE model_id = ?", (model_id,))
+
+    def save_chunk_embedding(self, chunk_id: int, model_id: str, vector: Any, text_sha256: str) -> None:
+        """Save a float32 vector blob for a chunk."""
+        model = self.get_embedding_model(model_id)
+        if not model:
+            raise ValueError(f"Unknown embedding model: {model_id}")
+
+        dim = model["dimension"]
+        should_norm = model["normalization"].lower() == "l2"
+        blob = vector_to_blob(vector, expected_dim=dim, normalize=should_norm)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO chunk_embeddings (chunk_id, model_id, text_sha256, vector, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (chunk_id, model_id, text_sha256, blob, now_iso),
+            )
+
+    def get_chunk_embedding(self, chunk_id: int, model_id: str) -> Optional[np.ndarray]:
+        """Fetch and deserialize a chunk's float32 embedding vector."""
+        model = self.get_embedding_model(model_id)
+        if not model:
+            return None
+
+        cur = self.conn.execute(
+            "SELECT vector FROM chunk_embeddings WHERE chunk_id = ? AND model_id = ?",
+            (chunk_id, model_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        return blob_to_vector(row["vector"], expected_dim=model["dimension"])
+
+    def get_chunk_embeddings_for_model(self, model_id: str) -> Tuple[List[int], np.ndarray]:
+        """
+        Load all chunk embeddings for a model into an in-memory NumPy matrix (N, D).
+        Returns (chunk_ids, matrix).
+        """
+        model = self.get_embedding_model(model_id)
+        if not model:
+            raise ValueError(f"Unknown embedding model: {model_id}")
+
+        dim = model["dimension"]
+        cur = self.conn.execute(
+            "SELECT chunk_id, vector FROM chunk_embeddings WHERE model_id = ? ORDER BY chunk_id ASC",
+            (model_id,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return [], np.empty((0, dim), dtype=np.float32)
+
+        chunk_ids = [r["chunk_id"] for r in rows]
+        vectors = [blob_to_vector(r["vector"], expected_dim=dim) for r in rows]
+        matrix = np.vstack(vectors).astype(np.float32)
+        return chunk_ids, matrix
+
+    def update_semantic_state(
+        self,
+        document_id: str,
+        model_id: str,
+        status: str,
+        embedded_chunks: int,
+        total_chunks: int,
+        last_error: Optional[str] = None,
+    ) -> None:
+        """Update or insert semantic state for a document and model."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO semantic_state (
+                    document_id, model_id, status, embedded_chunks, total_chunks, last_error, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (document_id, model_id, status, embedded_chunks, total_chunks, last_error, now_iso),
+            )
+
+    def get_semantic_status(self, model_id: Optional[str] = None) -> Dict[str, Any]:
+        """Return comprehensive status of the semantic infrastructure."""
+        models = self.list_embedding_models()
+        active_model_id = model_id or (models[0]["model_id"] if models else None)
+
+        cur_tot_docs = self.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        cur_tot_chunks = self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+
+        embedded_count = 0
+        ready_docs = 0
+        if active_model_id:
+            cur_emb = self.conn.execute(
+                "SELECT COUNT(*) FROM chunk_embeddings WHERE model_id = ?", (active_model_id,)
+            )
+            embedded_count = cur_emb.fetchone()[0]
+
+            cur_ready = self.conn.execute(
+                "SELECT COUNT(*) FROM semantic_state WHERE model_id = ? AND status = 'READY'", (active_model_id,)
+            )
+            ready_docs = cur_ready.fetchone()[0]
+
+        return {
+            "schema_version": 2,
+            "semantic_enabled": getattr(self.config, "semantic_enabled", False),
+            "models_registered": len(models),
+            "active_model_id": active_model_id,
+            "models": models,
+            "total_documents": cur_tot_docs,
+            "documents_ready": ready_docs,
+            "total_chunks": cur_tot_chunks,
+            "chunks_embedded": embedded_count,
+            "fts5_baseline": "READY",
+        }
+
+    def verify_semantic_integrity(self, model_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Deep integrity check of semantic infrastructure:
+          - Model contracts validity
+          - Vector blob size = dimension * 4 bytes
+          - Finite values and L2 norms ≈ 1.0
+          - text_sha256 freshness against current chunk text
+          - Absence of orphan embeddings
+          - Ready documents chunk parity
+        """
+        models = self.list_embedding_models()
+        target_models = [m for m in models if m["model_id"] == model_id] if model_id else models
+
+        issues: List[str] = []
+        vectors_checked = 0
+        stale_embeddings = 0
+
+        for m in target_models:
+            m_id = m["model_id"]
+            dim = m["dimension"]
+            expected_bytes = dim * 4
+            passage_tpl = m.get("passage_template") or "{text}"
+
+            # 1. Check all vectors for this model
+            cur = self.conn.execute(
+                """
+                SELECT ce.chunk_id, ce.text_sha256, ce.vector, c.display_text
+                FROM chunk_embeddings ce
+                JOIN chunks c ON ce.chunk_id = c.id
+                WHERE ce.model_id = ?
+                """,
+                (m_id,),
+            )
+            for row in cur.fetchall():
+                vectors_checked += 1
+                b = row["vector"]
+                if len(b) != expected_bytes:
+                    issues.append(f"Chunk {row['chunk_id']}: blob size {len(b)} != expected {expected_bytes}")
+                    continue
+
+                arr = np.frombuffer(b, dtype=np.float32)
+                if not np.all(np.isfinite(arr)):
+                    issues.append(f"Chunk {row['chunk_id']}: vector contains non-finite values")
+                    continue
+
+                norm = float(np.linalg.norm(arr))
+                if m["normalization"].lower() == "l2" and abs(norm - 1.0) > 1e-4:
+                    issues.append(f"Chunk {row['chunk_id']}: norm {norm:.6f} != 1.0")
+
+                # Freshness check: current chunk text SHA vs stored text_sha256
+                current_emb_text = build_embedding_text(row["display_text"], passage_tpl)
+                expected_sha = compute_text_sha256(current_emb_text)
+                if row["text_sha256"] != expected_sha:
+                    stale_embeddings += 1
+
+            # 2. Check for orphan embeddings (chunk_id not in chunks)
+            cur_orphans = self.conn.execute(
+                """
+                SELECT COUNT(*) FROM chunk_embeddings
+                WHERE model_id = ? AND chunk_id NOT IN (SELECT id FROM chunks)
+                """,
+                (m_id,),
+            )
+            orphan_count = cur_orphans.fetchone()[0]
+            if orphan_count > 0:
+                issues.append(f"Found {orphan_count} orphan embeddings for model {m_id}")
+
+            # 3. Check ready document chunk parity
+            cur_states = self.conn.execute(
+                """
+                SELECT document_id, embedded_chunks, total_chunks
+                FROM semantic_state
+                WHERE model_id = ? AND status = 'READY'
+                """,
+                (m_id,),
+            )
+            for s in cur_states.fetchall():
+                if s["embedded_chunks"] != s["total_chunks"]:
+                    issues.append(
+                        f"Doc {s['document_id']}: READY status but embedded_chunks ({s['embedded_chunks']}) != total_chunks ({s['total_chunks']})"
+                    )
+
+        return {
+            "all_healthy": len(issues) == 0 and stale_embeddings == 0,
+            "models_checked": len(target_models),
+            "vectors_checked": vectors_checked,
+            "stale_embeddings": stale_embeddings,
+            "issues_count": len(issues),
+            "issues": issues[:10],
+        }
 

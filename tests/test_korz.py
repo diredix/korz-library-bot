@@ -51,17 +51,18 @@ class TestKorzCore(unittest.TestCase):
 
         cur = self.lib.conn.execute("PRAGMA user_version;")
         v = cur.fetchone()[0]
-        self.assertEqual(v, 1)
+        self.assertEqual(v, 2)
 
         cur = self.lib.conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = {r[0] for r in cur.fetchall()}
-        expected = {"schema_migrations", "sources", "documents", "pages", "paragraphs", "chunks", "paragraphs_fts", "ingest_history"}
+        expected = {"schema_migrations", "sources", "documents", "pages", "paragraphs", "chunks", "paragraphs_fts", "ingest_history", "embedding_models", "chunk_embeddings", "semantic_state"}
         self.assertTrue(expected.issubset(tables))
 
-        cur = self.lib.conn.execute("SELECT version, description FROM schema_migrations;")
+        cur = self.lib.conn.execute("SELECT version, description FROM schema_migrations ORDER BY version;")
         migs = cur.fetchall()
-        self.assertEqual(len(migs), 1)
+        self.assertEqual(len(migs), 2)
         self.assertEqual(migs[0][0], 1)
+        self.assertEqual(migs[1][0], 2)
 
     def test_text_processor_and_separator_elimination(self):
         """Test that separators and markdown images are eliminated from indexing."""
