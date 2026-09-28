@@ -489,6 +489,12 @@ async def main():
     shadow_runner = ShadowRunner(lib, max_concurrency=1)
     if lib.config.shadow_enabled:
         logger.info("👻 Shadow Mode активовано: фоновий збір та аналітика семантичного пошуку")
+        try:
+            logger.info("⚡ Виконується warm-up семантичної моделі та завантаження індексу...")
+            warmup_sec = lib.warmup_semantic()
+            logger.info(f"⚡ Warm-up завершено успішно за {warmup_sec:.2f} с. Подальші пошуки у фоні виконуватимуться з мінімальною латентністю (~20-50 ms).")
+        except Exception as e:
+            logger.warning(f"⚠️ Попередження: не вдалося виконати warm-up семантичного рушія: {e}")
 
     bot = Bot(token=token)
 

@@ -434,12 +434,30 @@ def compute_simulated_rrf(
 ) -> Tuple[List[Dict[str, Any]], int, int, int]:
     """
     Compute Reciprocal Rank Fusion (RRF) simulation with fixed k parameter (default: 60).
+    Applies:
+      1. Deduplication to canonical paragraph_id (preserving highest scoring/earliest rank).
+      2. Exact Wins rule: exact substring match at rank 1 is strictly preserved as rank 1.
     RRF Score: sum(1.0 / (k + rank_m)) for m in {fts, sem}.
     Returns:
       (simulated_rrf_top, overlap_at_5, overlap_at_10, top1_match)
     """
-    fts_top10 = fts_results[:10]
-    sem_top10 = semantic_results[:10]
+    # 1. Deduplicate FTS and Semantic candidates to unique paragraph_ids
+    seen_fts = set()
+    deduped_fts: List["SearchResult"] = []
+    for r in fts_results:
+        if r.paragraph_id not in seen_fts:
+            seen_fts.add(r.paragraph_id)
+            deduped_fts.append(r)
+
+    seen_sem = set()
+    deduped_sem: List["SearchResult"] = []
+    for r in semantic_results:
+        if r.paragraph_id not in seen_sem:
+            seen_sem.add(r.paragraph_id)
+            deduped_sem.append(r)
+
+    fts_top10 = deduped_fts[:10]
+    sem_top10 = deduped_sem[:10]
 
     fts_ranks: Dict[int, Tuple[int, "SearchResult"]] = {r.paragraph_id: (idx + 1, r) for idx, r in enumerate(fts_top10)}
     sem_ranks: Dict[int, Tuple[int, "SearchResult"]] = {r.paragraph_id: (idx + 1, r) for idx, r in enumerate(sem_top10)}
@@ -452,7 +470,10 @@ def compute_simulated_rrf(
     sem_pids_10 = set(sem_ranks.keys())
     overlap_at_10 = len(fts_pids_10 & sem_pids_10)
 
-    top1_match = 1 if (fts_results and semantic_results and fts_results[0].paragraph_id == semantic_results[0].paragraph_id) else 0
+    top1_match = 1 if (deduped_fts and deduped_sem and deduped_fts[0].paragraph_id == deduped_sem[0].paragraph_id) else 0
+
+    # Exact Wins rule: exact phrase match at rank 1 is pinned to top
+    exact_pid = deduped_fts[0].paragraph_id if (deduped_fts and deduped_fts[0].match_type == "exact") else None
 
     all_pids = set(fts_ranks.keys()) | set(sem_ranks.keys())
     scored_items = []
@@ -469,6 +490,10 @@ def compute_simulated_rrf(
             rank_sem, sem_r = sem_ranks[pid]
             sample_r = sample_r or sem_r
             rrf_score += 1.0 / (k + rank_sem)
+
+        # Exact Wins: pin exact match at rank 1
+        if pid == exact_pid:
+            rrf_score += 10.0
 
         rank_delta = (rank_fts - rank_sem) if (rank_fts is not None and rank_sem is not None) else None
 
@@ -2377,6 +2402,22 @@ class KorzLibrary:
         self._active_model_id = target_model
         return index
 
+    def warmup_semantic(self, model_id: Optional[str] = None) -> float:
+        """
+        Pre-load semantic index into memory and warm up ONNX embedding model with a dummy query.
+        Returns elapsed warm-up time in seconds.
+        """
+        t0 = time.perf_counter()
+        target_model = model_id or self._active_model_id or self.get_default_model_id()
+        if not target_model:
+            return 0.0
+        self.load_semantic_index(target_model)
+        model_info = self.get_embedding_model(target_model)
+        if model_info:
+            backend = self.get_backend(model_info["model_name"])
+            backend.encode_queries(["warmup_query"])
+        return time.perf_counter() - t0
+
     def build_semantic_index(
         self,
         model_id: Optional[str] = None,
@@ -2893,7 +2934,10 @@ class KorzLibrary:
         failed = [r for r in rows if r["shadow_status"] != "SUCCESS"]
 
         fts_lats = sorted([r["latency_fts_ms"] for r in successful if r["latency_fts_ms"] is not None])
-        sem_lats = sorted([r["latency_semantic_ms"] for r in successful if r["latency_semantic_ms"] is not None])
+        sem_lats_chronological = [r["latency_semantic_ms"] for r in successful if r["latency_semantic_ms"] is not None]
+        sem_lats = sorted(sem_lats_chronological)
+        cold_start_lat = round(sem_lats_chronological[0], 2) if sem_lats_chronological else 0.0
+        sem_lats_warm = sorted(sem_lats_chronological[1:]) if len(sem_lats_chronological) > 1 else sem_lats
 
         def percentile(arr, p):
             if not arr:
@@ -2911,9 +2955,13 @@ class KorzLibrary:
             "fts_latency_p50": percentile(fts_lats, 0.50),
             "fts_latency_p95": percentile(fts_lats, 0.95),
             "fts_latency_p99": percentile(fts_lats, 0.99),
+            "semantic_cold_start_ms": cold_start_lat,
             "semantic_latency_p50": percentile(sem_lats, 0.50),
             "semantic_latency_p95": percentile(sem_lats, 0.95),
             "semantic_latency_p99": percentile(sem_lats, 0.99),
+            "semantic_latency_warm_p50": percentile(sem_lats_warm, 0.50),
+            "semantic_latency_warm_p95": percentile(sem_lats_warm, 0.95),
+            "semantic_latency_warm_p99": percentile(sem_lats_warm, 0.99),
         }
 
         top1_matches = sum(1 for r in successful if r["top1_match"] == 1)

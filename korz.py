@@ -501,8 +501,10 @@ def cmd_shadow_report(args, lib: KorzLibrary) -> None:
     print(f"Збоїв у фоні (failures):   {rep['failed_queries']}")
 
     print("\n⏱️  Операційна латентність (CPU):")
-    print(f"  FTS5 / BM25:   P50: {op.get('fts_latency_p50', 0)} ms | P95: {op.get('fts_latency_p95', 0)} ms | P99: {op.get('fts_latency_p99', 0)} ms")
-    print(f"  Semantic:      P50: {op.get('semantic_latency_p50', 0)} ms | P95: {op.get('semantic_latency_p95', 0)} ms | P99: {op.get('semantic_latency_p99', 0)} ms")
+    print(f"  FTS5 / BM25:       P50: {op.get('fts_latency_p50', 0)} ms | P95: {op.get('fts_latency_p95', 0)} ms | P99: {op.get('fts_latency_p99', 0)} ms")
+    print(f"  Semantic (Warm):   P50: {op.get('semantic_latency_warm_p50', op.get('semantic_latency_p50', 0))} ms | P95: {op.get('semantic_latency_warm_p95', op.get('semantic_latency_p95', 0))} ms | P99: {op.get('semantic_latency_warm_p99', op.get('semantic_latency_p99', 0))} ms")
+    if op.get("semantic_cold_start_ms"):
+        print(f"  Semantic Cold-start: {op.get('semantic_cold_start_ms', 0)} ms (перший ONNX інференс)")
 
     print("\n🔀 Розходження видачі (Retrieval Divergence):")
     print(f"  Top-1 однаковий (#1 збіг):     {div.get('top1_match_pct', 0)}% ({div.get('top1_match_count', 0)} / {rep['successful_queries']})")

@@ -369,6 +369,54 @@ class TestShadowV2C(unittest.TestCase):
         self.assertEqual(len(results), 10)
         self.assertTrue(all(r is not None for r in results))
 
+    def test_61_rrf_deduplication_by_paragraph_id(self):
+        """Test 61: Multiple chunks from the same paragraph must deduplicate to single best rank."""
+        fts = [
+            SearchResult(paragraph_id=10, document_id="d1", title="T", author="A", page=1, paragraph_index=1, text="p", snippet="s", score=5.0, match_type="fts")
+        ]
+        # Semantic returns two chunks for paragraph 20 (chunk A rank 1, chunk B rank 2), then paragraph 30 (rank 3)
+        sem = [
+            SearchResult(paragraph_id=20, document_id="d1", title="T", author="A", page=2, paragraph_index=1, text="p20a", snippet="s", score=0.95, match_type="semantic"),
+            SearchResult(paragraph_id=20, document_id="d1", title="T", author="A", page=2, paragraph_index=1, text="p20b", snippet="s", score=0.90, match_type="semantic"),
+            SearchResult(paragraph_id=30, document_id="d1", title="T", author="A", page=3, paragraph_index=1, text="p30", snippet="s", score=0.85, match_type="semantic"),
+        ]
+
+        rrf_top, o5, o10, top1 = compute_simulated_rrf(fts, sem, k=60, top_limit=5)
+        # Should have unique paragraph IDs
+        pids = [item["paragraph_id"] for item in rrf_top]
+        self.assertEqual(len(pids), len(set(pids)))
+        self.assertEqual(pids.count(20), 1)
+
+        # Paragraph 20 must have retained its top rank (rank 1), not degraded by chunk B
+        p20 = next(x for x in rrf_top if x["paragraph_id"] == 20)
+        self.assertEqual(p20["rank_sem"], 1)
+
+    def test_62_rrf_exact_wins_pinning(self):
+        """Test 62: Exact phrase match at rank 1 in FTS must be strictly pinned as rank 1 in RRF."""
+        # FTS has exact match for paragraph 99
+        fts = [
+            SearchResult(paragraph_id=99, document_id="d1", title="T", author="A", page=1, paragraph_index=1, text="exact text", snippet="s", score=100.0, match_type="exact")
+        ]
+        # Semantic has completely different strong hit for paragraph 42
+        sem = [
+            SearchResult(paragraph_id=42, document_id="d1", title="T", author="A", page=2, paragraph_index=1, text="other text", snippet="s", score=0.99, match_type="semantic")
+        ]
+
+        rrf_top, _, _, _ = compute_simulated_rrf(fts, sem, k=60, top_limit=5)
+        # Exact match 99 must win rank 1
+        self.assertEqual(rrf_top[0]["paragraph_id"], 99)
+        self.assertEqual(rrf_top[0]["rank"], 1)
+        self.assertGreater(rrf_top[0]["score"], 1.0)  # Contains exact match boost
+
+    def test_63_warmup_semantic_loads_and_runs(self):
+        """Test 63: warmup_semantic executes cleanly and populates in-memory index."""
+        with KorzLibrary(self.config) as lib:
+            lib.set_backend("mock://v2c-test-model", self.mock_backend)
+            elapsed = lib.warmup_semantic(model_id=self.model_id)
+            self.assertGreaterEqual(elapsed, 0.0)
+            self.assertIsNotNone(lib._semantic_index)
+            self.assertEqual(lib._semantic_index.model_id, self.model_id)
+
 
 if __name__ == "__main__":
     unittest.main()
