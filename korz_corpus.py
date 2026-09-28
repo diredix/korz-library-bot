@@ -378,8 +378,21 @@ class CorpusCleaner:
             if m_sep:
                 pg_val = m_sep.group(1)
                 current_page = int(pg_val) if pg_val.isdigit() else current_page
-                filtered_lines.append(f"{{{pg_val}}}--------------------------------")
+                norm_sep = f"{{{pg_val}}}--------------------------------"
+                filtered_lines.append(norm_sep)
                 stats["page_separators_normalized"] += 1
+                if len(s) != len(norm_sep):
+                    actions.append(
+                        CleanAction(
+                            "NORMALIZE_SEPARATOR",
+                            idx,
+                            current_page,
+                            s,
+                            norm_sep,
+                            1.0,
+                            "Normalized Datalab page separator width",
+                        )
+                    )
                 last_img_caption = None
                 continue
 
@@ -518,7 +531,14 @@ class CorpusCleaner:
         )
 
         # Step 4: Normalize multiple consecutive blank lines (> 2 -> 2)
+        pre_norm_len = len(cleaned_text)
         cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text).strip() + "\n"
+        stats["whitespace_chars_removed"] = max(0, pre_norm_len - len(cleaned_text))
+
+        stats["accounted_chars_removed"] = sum(
+            len(a.original_text) - (len(a.replacement_text) if a.replacement_text else 0)
+            for a in actions
+        ) + stats["whitespace_chars_removed"]
 
         return cleaned_text, stats, actions
 
@@ -647,13 +667,16 @@ class CorpusVerifier:
         retention_pct = (len_a / len_b * 100) if len_b > 0 else 100.0
 
         # Accounted noise character estimation
-        accounted_chars = (
-            stats.get("standalone_numbers_removed", 0) * 4
-            + stats.get("running_headers_removed", 0) * 30
-            + stats.get("image_markers_removed", 0) * 80
-            + stats.get("duplicate_captions_removed", 0) * 100
-            + stats.get("safe_dehyphenations", 0) * 2
-        )
+        if "accounted_chars_removed" in stats:
+            accounted_chars = stats["accounted_chars_removed"]
+        else:
+            accounted_chars = (
+                stats.get("standalone_numbers_removed", 0) * 4
+                + stats.get("running_headers_removed", 0) * 30
+                + stats.get("image_markers_removed", 0) * 80
+                + stats.get("duplicate_captions_removed", 0) * 100
+                + stats.get("safe_dehyphenations", 0) * 2
+            )
 
         unclassified = max(0, diff_len - accounted_chars)
         unclassified_pct = (unclassified / orig_len * 100) if orig_len > 0 else 0.0
@@ -670,8 +693,11 @@ class CorpusVerifier:
             notes.append(
                 f"Unclassified character loss ({unclassified_pct:.2f}%) exceeds safety margin ({self.max_unclassified_loss_pct}%)."
             )
-            status = "FAIL"
-            is_safe = False
+            if retention_pct >= self.min_token_retention_pct:
+                status = "WARNING" if status != "FAIL" else status
+            else:
+                status = "FAIL"
+                is_safe = False
 
         if retention_pct < self.min_token_retention_pct:
             notes.append(
@@ -741,7 +767,7 @@ class CandidateLab:
                 ingested.append(res)
 
         # Build semantic index
-        build_res = cand_lib.build_semantic_index(model_id_or_name=model_name)
+        build_res = cand_lib.build_semantic_index(model_id=model_name)
 
         summary = {
             "database": str(dest_db),

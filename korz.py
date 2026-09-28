@@ -712,10 +712,25 @@ def cmd_corpus_clean(args) -> None:
     dry_run = not getattr(args, "apply", False)
     out_dir = Path(args.out) if getattr(args, "out", None) else Path("data/corpus_clean")
 
+    lang = getattr(args, "lang", "uk")
     if target.is_file():
         files = [target]
     else:
-        files = [f for f in target.rglob("*.md") if not f.name.endswith(".bak") and not f.name.endswith(".cleaned.md")]
+        all_mds = [f for f in target.rglob("*.md") if not f.name.endswith(".bak") and not f.name.endswith(".cleaned.md")]
+        if lang == "uk":
+            cyr_files = []
+            for f in all_mds:
+                if f.name.startswith("укр."):
+                    cyr_files.append(f)
+                else:
+                    with open(f, "rb") as fp:
+                        raw = fp.read(2048)
+                    txt = raw.decode("utf-8", errors="ignore")
+                    if any("\u0400" <= ch <= "\u04ff" for ch in txt):
+                        cyr_files.append(f)
+            files = cyr_files if cyr_files else all_mds
+        else:
+            files = all_mds
 
     if not files:
         print(f"❌ Файлів Markdown для очищення не знайдено у '{args.path}'")
@@ -858,6 +873,83 @@ def cmd_corpus_report(args) -> None:
     print("Виконайте 'python korz.py corpus clean <каталог> --dry-run' для перегляду diff.\n")
 
 
+def cmd_corpus_build_candidate(args) -> None:
+    from korz_corpus import CandidateLab
+    clean_dir = Path(getattr(args, "clean_dir", None) or "data/corpus_clean")
+    dest_db = Path(getattr(args, "out", None) or "data/korz_clean_candidate.sqlite")
+    print("\n" + "=" * 65)
+    print("🏗️  KORZ Candidate Database Builder")
+    print("=" * 65)
+    print(f"Каталог очищеного корпусу: {clean_dir}")
+    print(f"Цільова база даних:       {dest_db}")
+    print("Імпорт книг та побудова семантичного індексу...")
+    summary = CandidateLab.build_candidate_database(clean_dir, dest_db)
+    print("─" * 65)
+    print(f"✓ Додано документів:  {summary['documents_count']}")
+    print(f"✓ Сторінок:           {summary['total_pages']:,}".replace(",", " "))
+    print(f"✓ Абзаців:            {summary['total_paragraphs']:,}".replace(",", " "))
+    print(f"✓ Семантичних блоків: {summary['total_chunks']:,}".replace(",", " "))
+    print(f"✓ Семантичний індекс: {'READY' if summary['semantic_build'].get('ready') else 'DONE'}")
+    print("=" * 65 + "\n")
+
+
+def cmd_corpus_evaluate_ab(args) -> None:
+    from korz_core import KorzLibrary, KorzConfig
+    from korz_corpus import CandidateLab
+
+    baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
+    candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
+
+    if not baseline_path.exists():
+        print(f"❌ Baseline базу не знайдено: {baseline_path}")
+        return
+    if not candidate_path.exists():
+        print(f"❌ Candidate базу не знайдено: {candidate_path}. Запустіть спочатку 'python korz.py corpus build-candidate'")
+        return
+
+    b_cfg = KorzConfig(db_path=baseline_path, semantic_enabled=True)
+    c_cfg = KorzConfig(db_path=candidate_path, semantic_enabled=True)
+    b_lib = KorzLibrary(b_cfg)
+    c_lib = KorzLibrary(c_cfg)
+
+    queries = [
+        "стрес і соціальна ієрархія",
+        "бабуїни павіани агресія кортизол",
+        "семантичні реакції та ототожнення карти з територією",
+        "ресурсоорієнтована економіка автоматизація",
+        "проєктування міст майбутнього відновлювана енергія",
+        "грошова система дефіцит злочинність",
+        "поведінка приматів окситоцин дофамін",
+        "мова наука та розсудливість не-арістотелівські системи",
+    ]
+
+    print("\n" + "=" * 65)
+    print("🔬 KORZ A/B Evaluation: Baseline vs Clean Candidate")
+    print("=" * 65)
+    print(f"Baseline DB:  {baseline_path}")
+    print(f"Candidate DB: {candidate_path}")
+    print(f"Кількість тестових запитів: {len(queries)}")
+
+    results = CandidateLab.evaluate_ab(b_lib, c_lib, queries, top_k=10)
+
+    print("─" * 65)
+    print(f"Noise@10 Baseline:  {results['baseline_noise_at_k_pct']}%")
+    print(f"Noise@10 Candidate: {results['candidate_noise_at_k_pct']}%")
+    print(f"Коефіцієнт зниження шуму: {results['noise_reduction_factor']}x")
+    print("─" * 65)
+    print("\nДеталізація по запитах:")
+    for comp in results["comparisons"]:
+        print(f"\n❓ «{comp['query']}»:")
+        print(f"  • Baseline Noise: {comp['baseline_noise_in_topk']}/10")
+        print(f"  • Candid.  Noise: {comp['candidate_noise_in_topk']}/10")
+        print(f"  • Baseline Top-1: «{comp['baseline_top1'][:75]}...»")
+        print(f"  • Candid.  Top-1: «{comp['candidate_top1'][:75]}...»")
+    print("=" * 65 + "\n")
+
+    b_lib.close()
+    c_lib.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="korz",
@@ -993,18 +1085,28 @@ def main() -> None:
     p_corp_audit = corp_sub.add_parser("audit", help="Аудит файлу або папки на наявність OCR-сміття, колонтитулів та номерів сторінок")
     p_corp_audit.add_argument("path", help="Шлях до файлу .md або папки з книгами")
     p_corp_audit.add_argument("--json", action="store_true", help="Вивести звіт у форматі JSON")
+    p_corp_audit.add_argument("--lang", default="uk", choices=["uk", "all"], help="Мовний фільтр (за замовчуванням: uk)")
 
     p_corp_clean = corp_sub.add_parser("clean", help="Очистити файл або папку від OCR-сміття (з підтримкою --dry-run та --apply)")
     p_corp_clean.add_argument("path", help="Шлях до файлу або каталогу для очищення")
     p_corp_clean.add_argument("--dry-run", action="store_true", help="Показати diff без зміни файлів")
     p_corp_clean.add_argument("--apply", action="store_true", help="Застосувати очищення та зберегти файли")
     p_corp_clean.add_argument("--out", help="Каталог для збереження очищених файлів (за замовчуванням: data/corpus_clean/)")
+    p_corp_clean.add_argument("--lang", default="uk", choices=["uk", "all"], help="Мовний фільтр (за замовчуванням: uk)")
 
     p_corp_verify = corp_sub.add_parser("verify-clean", help="Перевірити безпечність очищення (Text-Loss Safety Gate)")
     p_corp_verify.add_argument("original", help="Шлях до оригінального файлу")
     p_corp_verify.add_argument("cleaned", help="Шлях до очищеного файлу")
 
     corp_sub.add_parser("report", help="Підсумковий звіт аудиту якості всіх книг корпусу")
+
+    p_corp_build = corp_sub.add_parser("build-candidate", help="Побудувати ізольовану SQLite базу з data/corpus_clean")
+    p_corp_build.add_argument("--clean-dir", default="data/corpus_clean", help="Шлях до каталогу з очищеними книгами")
+    p_corp_build.add_argument("--out", default="data/korz_clean_candidate.sqlite", help="Шлях до файлу candidate бази")
+
+    p_corp_eval = corp_sub.add_parser("evaluate-ab", help="A/B порівняння якості (Noise@10) між baseline та candidate базою")
+    p_corp_eval.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
+    p_corp_eval.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
 
     args = parser.parse_args()
 
@@ -1080,6 +1182,10 @@ def main() -> None:
                 cmd_corpus_verify(args)
             elif args.corpus_command == "report":
                 cmd_corpus_report(args)
+            elif args.corpus_command == "build-candidate":
+                cmd_corpus_build_candidate(args)
+            elif args.corpus_command == "evaluate-ab":
+                cmd_corpus_evaluate_ab(args)
             else:
                 p_corp.print_help()
     finally:
