@@ -102,6 +102,89 @@ class TestAnswerEngine(unittest.TestCase):
         sent_text = mock_msg.answer.call_args[0][0]
         self.assertIn("Режим /answer наразі вимкнено", sent_text)
 
+    def test_citation_verification_pass(self):
+        """Verify Citation Verification Pass sanitizes out-of-bounds citations and detects ungrounded claims."""
+        from korz_answer import AnswerSource
+        engine = AnswerEngine(self.lib, AnswerConfig(enabled=True))
+
+        mock_sources = [
+            AnswerSource(1, 101, "doc1", "Автор", "Книга", 10, 1, "Текст джерела 1", 0.88),
+            AnswerSource(2, 102, "doc1", "Автор", "Книга", 11, 2, "Текст джерела 2", 0.85),
+        ]
+
+        # Text with valid [1], invalid [9], and an unsupported claim
+        raw_llm_text = (
+            "Соціальний статус викликає фізіологічний стрес [1]. "
+            "Цей стрес може призводити до тривожності [9]. "
+            "Це загальновідомий психологічний факт."
+        )
+
+        verified_text, used_sources, unsupported_cnt, is_valid = engine._verify_and_filter_citations(
+            raw_llm_text, mock_sources
+        )
+
+        self.assertTrue(is_valid)
+        self.assertEqual(len(used_sources), 1)
+        self.assertEqual(used_sources[0].citation_index, 1)
+        self.assertNotIn("[9]", verified_text)
+        self.assertIn("[1]", verified_text)
+        self.assertGreaterEqual(unsupported_cnt, 1)
+
+    def test_generative_fallback_when_ollama_unavailable(self):
+        """Verify graceful fallback with explicit fallback_reason when generative backend is requested."""
+        cfg = AnswerConfig(enabled=True, backend="generative", min_similarity=0.75, ollama_url="http://localhost:65432")
+        engine = AnswerEngine(self.lib, cfg)
+
+        res = engine.answer("Чому соціальний статус впливає на здоров'я?")
+        self.assertEqual(res.mode, "extractive")
+        self.assertIsNotNone(res.fallback_reason)
+        self.assertIn("Ollama", res.fallback_reason)
+        self.assertGreater(len(res.sources), 0)
+
+    def test_bot_answer_feedback_callbacks(self):
+        """Verify bot cb_feedback records 3-tier answer quality feedback."""
+        bot.lib = self.lib
+
+        # Test ans_up
+        cb1 = MagicMock()
+        cb1.data = "fb:ans_up:42"
+        cb1.from_user.id = 12345
+        cb1.message.reply_to_message.text = "тестове питання"
+        cb1.answer = AsyncMock()
+
+        asyncio.run(bot.cb_feedback(cb1))
+        self.assertTrue(cb1.answer.called)
+
+        # Test ans_part
+        cb2 = MagicMock()
+        cb2.data = "fb:ans_part:42"
+        cb2.from_user.id = 12345
+        cb2.message.reply_to_message.text = "тестове питання"
+        cb2.answer = AsyncMock()
+
+        asyncio.run(bot.cb_feedback(cb2))
+        self.assertTrue(cb2.answer.called)
+
+        # Test ans_dn
+        cb3 = MagicMock()
+        cb3.data = "fb:ans_dn:0"
+        cb3.from_user.id = 12345
+        cb3.message.reply_to_message.text = "тестове питання"
+        cb3.answer = AsyncMock()
+
+        asyncio.run(bot.cb_feedback(cb3))
+        self.assertTrue(cb3.answer.called)
+
+        # Check in DB
+        rows = self.lib.conn.execute(
+            "SELECT feedback_type FROM search_feedback WHERE user_id = '12345' ORDER BY id DESC LIMIT 3"
+        ).fetchall()
+        types = [r[0] for r in rows]
+        self.assertIn("answer_irrelevant", types)
+        self.assertIn("answer_partial", types)
+        self.assertIn("answer_accurate", types)
+
 
 if __name__ == "__main__":
     unittest.main()
+

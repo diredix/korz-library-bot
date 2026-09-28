@@ -488,7 +488,14 @@ async def cmd_answer(message: types.Message):
             return
 
         clean_q = html.escape(question)
-        mode_badge = "Extractive (буквальні цитати)" if res.mode == "extractive" else "Generative LLM"
+        if res.mode == "extractive" and res.fallback_reason:
+            clean_fb = html.escape(res.fallback_reason)
+            mode_badge = f"Extractive (source-bound, fallback: {clean_fb})"
+        elif res.mode == "extractive":
+            mode_badge = "Extractive (source-bound)"
+        else:
+            mode_badge = "Generative LLM (з верифікацією джерел)"
+
         header = (
             f"📚 <b>Відповідь за бібліотекою KORZ:</b>\n"
             f"<i>(«{clean_q}» | {mode_badge} | {latency:.0f} ms)</i>\n\n"
@@ -521,16 +528,21 @@ async def cmd_answer(message: types.Message):
             chunk_kb = kb if i == len(chunks) - 1 else None
             await message.answer(chunk, reply_markup=chunk_kb, parse_mode=ParseMode.HTML)
 
+        target_pid = res.sources[0].paragraph_id if res.sources else 0
         fb_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
                         text="👍 Відповідь точна",
-                        callback_data=f"fb:up:{res.sources[0].paragraph_id if res.sources else 0}",
+                        callback_data=f"fb:ans_up:{target_pid}",
                     ),
                     InlineKeyboardButton(
-                        text="👎 Не те",
-                        callback_data="fb:dn:0",
+                        text="⚠️ Частково",
+                        callback_data=f"fb:ans_part:{target_pid}",
+                    ),
+                    InlineKeyboardButton(
+                        text="👎 Не відповідає",
+                        callback_data="fb:ans_dn:0",
                     ),
                 ]
             ]
@@ -668,7 +680,14 @@ async def cb_feedback(callback: types.CallbackQuery):
             query_text = callback.message.reply_to_message.text.strip()
 
         user_str = str(callback.from_user.id)
-        type_map = {"tgt": "target", "up": "found", "dn": "not_relevant"}
+        type_map = {
+            "tgt": "target",
+            "up": "found",
+            "dn": "not_relevant",
+            "ans_up": "answer_accurate",
+            "ans_part": "answer_partial",
+            "ans_dn": "answer_irrelevant",
+        }
         canonical_type = type_map.get(fb_type, "found")
 
         if lib:
@@ -681,8 +700,12 @@ async def cb_feedback(callback: types.CallbackQuery):
 
         if fb_type == "tgt":
             toast = "Дякуємо! Фрагмент позначено як цільовий 🎯"
-        elif fb_type == "up":
+        elif fb_type in ("up", "ans_up"):
             toast = "Дякуємо за оцінку! 👍"
+        elif fb_type == "ans_part":
+            toast = "Дякуємо! Відповідь оцінено як часткову ⚠️"
+        elif fb_type == "ans_dn":
+            toast = "Дякуємо! Врахуємо для покращення рушія відповідей 👎"
         else:
             toast = "Дякуємо! Врахуємо для покращення ✍️"
 

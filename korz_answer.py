@@ -11,14 +11,14 @@ Architectural Pipeline:
     Top K Candidate Passages (with cosine scores)
        │
        ▼
-    Sufficient Information Gate (checks min_similarity threshold)
+    Sufficient Information Gate (experimental min_similarity threshold)
        │
        ├─ [Insufficient] ──► Graceful refusal ("У бібліотеці немає достатньо даних...")
        │
        ▼
     Answer Modality:
-       ├─ Extractive Engine  ──► Zero hallucination, selects exact salience sentences from SQLite
-       └─ Generative (Local) ──► Grounded LLM (Ollama / Local API) with strict citation contract
+       ├─ Extractive Engine  ──► Source-bound, selects exact salience sentences from SQLite (no generative drift)
+       └─ Generative (Local) ──► Grounded LLM (Ollama) with Citation Verification Pass
        │
        ▼
     Structured AnswerResult with verifiable source paragraph_ids and page numbers.
@@ -65,6 +65,8 @@ class AnswerResult:
     is_grounded: bool = True
     insufficient_info: bool = False
     error: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    unsupported_claims_count: int = 0
 
 
 @dataclass
@@ -184,8 +186,8 @@ class AnswerEngine:
 
     def _extractive_answer(self, question: str, sources: List[AnswerSource]) -> AnswerResult:
         """
-        Extractive QA: selects high-salience sentences matching the question directly from authentic text.
-        Guarantees zero synthetic hallucination.
+        Extractive QA: Source-bound selection of high-salience sentences directly from authentic text.
+        Guarantees zero generative hallucinations, but subject to retrieval and relevance accuracy.
         """
         q_words = set(re.findall(r"\w+", question.lower()))
         stop_words = {"і", "та", "й", "або", "чи", "що", "як", "де", "чому", "коли", "хто", "який", "яка", "яке", "які", "про", "для", "на", "у", "в", "з", "із", "зі", "до", "від", "це", "той", "ті", "цей", "ця"}
@@ -238,10 +240,49 @@ class AnswerEngine:
             is_grounded=True,
         )
 
+    def _verify_and_filter_citations(
+        self,
+        generated_text: str,
+        sources: List[AnswerSource],
+    ) -> Tuple[str, List[AnswerSource], int, bool]:
+        """
+        Citation Verification Pass:
+        1. Checks that all cited indices [N] exist in candidate sources.
+        2. Filters or removes hallucinated out-of-bounds citations (e.g. [8] when only 3 sources).
+        3. Identifies claims lacking citation support.
+        Returns: (verified_text, valid_used_sources, unsupported_claims_count, is_valid)
+        """
+        valid_indices = {s.citation_index for s in sources}
+        found_cits = [int(m) for m in re.findall(r"\[(\d+)\]", generated_text)]
+
+        # Check for invalid citations
+        invalid_cits = [c for c in found_cits if c not in valid_indices]
+        verified_text = generated_text
+        if invalid_cits:
+            logger.warning(f"Citation Verification: Found out-of-bounds citations {invalid_cits}; sanitizing.")
+            # Remove or replace invalid citation marks
+            for inv in set(invalid_cits):
+                verified_text = re.sub(rf"\[{inv}\]", "", verified_text)
+
+        # Re-check remaining valid citations
+        remaining_cits = set(int(m) for m in re.findall(r"\[(\d+)\]", verified_text))
+        used_sources = [s for s in sources if s.citation_index in remaining_cits]
+
+        # Analyze sentences for ungrounded claims
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", verified_text) if len(s.strip()) > 15]
+        unsupported = 0
+        for sent in sentences:
+            if not re.search(r"\[\d+\]", sent):
+                unsupported += 1
+
+        is_valid = len(used_sources) > 0 and len(remaining_cits) > 0
+        return verified_text, used_sources, unsupported, is_valid
+
     def _generative_llm_answer(self, question: str, sources: List[AnswerSource]) -> AnswerResult:
         """
-        Generative Answering via local LLM (Ollama) with strict source citation prompt.
-        If LLM call fails or times out, safely falls back to extractive answer.
+        Generative Answering via local LLM (Ollama) with strict citation contract
+        and an automated Citation Verification Pass.
+        If verification fails or LLM is unavailable, falls back to extractive mode with explicit notice.
         """
         # Prepare context blocks with clear citation markers
         context_blocks = []
@@ -266,6 +307,7 @@ class AnswerEngine:
             "ВІДПОВІДЬ ЗА ДЖЕРЕЛАМИ:"
         )
 
+        fallback_reason = None
         try:
             payload = {
                 "model": self.config.ollama_model,
@@ -287,25 +329,44 @@ class AnswerEngine:
                 generated = data.get("response", "").strip()
 
             if generated:
-                # Find which citations were actually referenced in generated text
-                referenced_cits = set(int(m) for m in re.findall(r"\[(\d+)\]", generated))
-                used_sources = [s for s in sources if s.citation_index in referenced_cits]
-                if not used_sources:
-                    used_sources = sources[:2]  # Fallback to top sources
+                # Check for explicit refusal by model
+                if "недостатньо інформації" in generated.lower():
+                    return AnswerResult(
+                        question=question,
+                        answer_text=generated,
+                        sources=sources[:2],
+                        mode="generative",
+                        is_grounded=True,
+                        insufficient_info=True,
+                    )
 
-                return AnswerResult(
-                    question=question,
-                    answer_text=generated,
-                    sources=used_sources,
-                    mode="generative",
-                    is_grounded=True,
+                # Citation Verification Pass
+                verified_text, used_sources, unsupported_cnt, is_valid = self._verify_and_filter_citations(
+                    generated, sources
                 )
+
+                if is_valid:
+                    return AnswerResult(
+                        question=question,
+                        answer_text=verified_text,
+                        sources=used_sources,
+                        mode="generative",
+                        is_grounded=True,
+                        unsupported_claims_count=unsupported_cnt,
+                    )
+                else:
+                    fallback_reason = "Генеративна LLM повернула текст без дійсних посилань на джерела"
+            else:
+                fallback_reason = "Генеративна LLM повернула порожню відповідь"
+
         except Exception as e:
-            logger.warning(f"Generative LLM answer failed ({e}); falling back to extractive answer.")
+            fallback_reason = f"Ollama недоступна ({e.__class__.__name__})"
+            logger.warning(f"Generative LLM answer failed: {e}; falling back to extractive answer.")
 
         # Fallback to extractive
         res = self._extractive_answer(question, sources)
-        res.error = "Generative LLM unavailable; used extractive fallback."
+        res.fallback_reason = fallback_reason or "Ollama fallback"
+        res.error = fallback_reason
         return res
 
     def _is_ollama_ready(self) -> bool:
@@ -318,3 +379,4 @@ class AnswerEngine:
                 return len(models) > 0
         except Exception:
             return False
+

@@ -179,7 +179,12 @@ def cmd_answer(args, lib: KorzLibrary) -> None:
         res = engine.answer(question, mode=mode, limit=limit, doc_id=doc_id)
 
         print("\n" + "=" * 65)
-        mode_label = "Extractive (буквальні цитати)" if res.mode == "extractive" else "Generative LLM (зв'язна відповідь)"
+        if res.mode == "extractive" and res.fallback_reason:
+            mode_label = f"Extractive (source-bound, fallback: {res.fallback_reason})"
+        elif res.mode == "extractive":
+            mode_label = "Extractive (source-bound, авторські речення)"
+        else:
+            mode_label = "Generative LLM (з верифікацією джерел)"
         print(f"📚 KORZ Answer Engine [{mode_label}] ({res.latency_ms:.1f} ms)")
         print("=" * 65)
         print(f"❓ Питання: «{question}»\n" + "─" * 65)
