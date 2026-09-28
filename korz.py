@@ -950,6 +950,123 @@ def cmd_corpus_evaluate_ab(args) -> None:
     c_lib.close()
 
 
+def cmd_corpus_align(args) -> None:
+    from korz_corpus import CorpusAligner
+    baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
+    candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
+    print("\n" + "=" * 65)
+    print("🔗 KORZ Cross-Corpus Content Alignment (CorpusParagraphMap)")
+    print("=" * 65)
+    print(f"Baseline DB:  {baseline_path}")
+    print(f"Candidate DB: {candidate_path}")
+    print("Побудова стабільного cross-corpus мапінгу абзаців...")
+    t0 = time.perf_counter()
+    res = CorpusAligner.build_alignment_map(baseline_path, candidate_path)
+    el = time.perf_counter() - t0
+    print("─" * 65)
+    print(f"• Оброблено Baseline абзаців: {res['total_baseline']:,}".replace(",", " "))
+    print(f"• Точний нормалізований збіг: {res['exact_normalized']:,} ({res['exact_normalized']*100/res['total_baseline']:.1f}%)".replace(",", " "))
+    print(f"• Незначні варіації очищення: {res['minor_variation']:,} ({res['minor_variation']*100/res['total_baseline']:.1f}%)".replace(",", " "))
+    print(f"• Зшиті через розрив сторінки: {res['cross_page_stitched']:,} ({res['cross_page_stitched']*100/res['total_baseline']:.1f}%)".replace(",", " "))
+    print(f"• Видалений OCR-шум:          {res['deleted_ocr_noise']:,} ({res['deleted_ocr_noise']*100/res['total_baseline']:.1f}%)".replace(",", " "))
+    print(f"• Рівень верифікованого мапінгу: {res['alignment_rate_pct']}%")
+    print(f"Час обчислення: {el:.1f} с")
+    print("✅ Таблицю corpus_paragraph_map та corpus_metadata збережено у Candidate DB.\n")
+
+
+def cmd_corpus_ab_shadow(args) -> None:
+    from korz_core import KorzLibrary, KorzConfig
+    from korz_corpus import CorpusParagraphMap, CorpusABShadowRunner
+
+    query = args.query.strip()
+    target_id = getattr(args, "target", None)
+    top_k = getattr(args, "limit", 10)
+
+    baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
+    candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
+
+    b_lib = KorzLibrary(KorzConfig(db_path=baseline_path, semantic_enabled=True))
+    c_lib = KorzLibrary(KorzConfig(db_path=candidate_path, semantic_enabled=True))
+    pmap = CorpusParagraphMap(candidate_path)
+    runner = CorpusABShadowRunner(b_lib, c_lib, pmap)
+
+    res = runner.evaluate_query(query, target_baseline_id=target_id, top_k=top_k)
+
+    print("\n" + "=" * 65)
+    print("🛰️  KORZ Corpus A/B Shadow Telemetry")
+    print("=" * 65)
+    print(f"❓ Запит: «{query}»")
+    if target_id:
+        print(f"🎯 Ціль: Baseline ID #{target_id} -> Clean ID #{res['target_clean_id']}")
+        sem_lift_str = f"{res['sem_rank_lift']:+d}" if res['sem_rank_lift'] is not None else "N/A"
+        print(f"   Semantic Rank: Baseline #{res['baseline_sem_rank']} -> Clean #{res['clean_sem_rank']} (Lift: {sem_lift_str})")
+        fts_lift_str = f"{res['fts_rank_lift']:+d}" if res['fts_rank_lift'] is not None else "N/A"
+        print(f"   FTS Rank:      Baseline #{res['baseline_fts_rank']} -> Clean #{res['clean_fts_rank']} (Lift: {fts_lift_str})")
+
+    print("\n📊 Метрики якості видачі:")
+    print("─" * 65)
+    print(f"• Content Overlap@5:   {res['content_overlap_at_5_pct']}%")
+    print(f"• Content Overlap@10:  {res['content_overlap_at_10_pct']}%")
+    print(f"• Noise@5:             Baseline: {res['baseline_noise_at_5']}/5 | Clean: {res['clean_noise_at_5']}/5")
+    print(f"• Noise@10:            Baseline: {res['baseline_noise_at_10']}/10 | Clean: {res['clean_noise_at_10']}/10")
+    print(f"• Top-1 Semantic Score: Baseline: {res['baseline_sem_score']} | Clean: {res['clean_sem_score']}")
+
+    print("\n🔍 Top-1 Порівняння:")
+    print(f"  [Baseline #{1}]: «{res['baseline_sem_top1']}...» (Шум: {'ТАК' if res['baseline_top1_is_noise'] else 'НІ'})")
+    print(f"  [Clean    #{1}]: «{res['clean_sem_top1']}...» (Шум: {'ТАК' if res['clean_top1_is_noise'] else 'НІ'})")
+    if res['clean_top1_in_baseline_rank']:
+        print(f"  ℹ️ Clean Top-1 у Baseline займав місце: #{res['clean_top1_in_baseline_rank']}")
+    print("=" * 65 + "\n")
+
+    b_lib.close()
+    c_lib.close()
+
+
+def cmd_corpus_promotion_gate(args) -> None:
+    from korz_core import KorzLibrary, KorzConfig
+    from korz_corpus import CorpusParagraphMap, CorpusABShadowRunner
+
+    baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
+    candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
+
+    b_lib = KorzLibrary(KorzConfig(db_path=baseline_path, semantic_enabled=True))
+    c_lib = KorzLibrary(KorzConfig(db_path=candidate_path, semantic_enabled=True))
+    pmap = CorpusParagraphMap(candidate_path)
+    runner = CorpusABShadowRunner(b_lib, c_lib, pmap)
+
+    benchmarks = [
+        {"query": "стрес і соціальна ієрархія", "target_id": 7033},
+        {"query": "бабуїни павіани агресія кортизол", "target_id": 12345},
+        {"query": "семантичні реакції та ототожнення карти з територією", "target_id": 5227},
+        {"query": "ресурсоорієнтована економіка автоматизація", "target_id": 3914},
+        {"query": "проєктування міст майбутнього відновлювана енергія", "target_id": 4445},
+        {"query": "грошова система дефіцит злочинність", "target_id": 4258},
+        {"query": "поведінка приматів окситоцин дофамін", "target_id": 2210},
+        {"query": "мова наука та розсудливість не-арістотелівські системи", "target_id": 5067},
+    ]
+
+    summary = runner.run_benchmark(benchmarks, top_k=10)
+    verdict = runner.check_promotion_gate(summary)
+
+    print("\n" + "=" * 65)
+    print("🛡️  KORZ Corpus v2 Clean Promotion Gate Verdict")
+    print("=" * 65)
+    print(f"Статус допуску до Production: [{verdict['status']}]")
+    print("─" * 65)
+    for g in verdict["gates"]:
+        icon = "✅" if g["passed"] else "❌"
+        print(f"  {icon} {g['name']:<27} : {g['detail']}")
+    print("─" * 65)
+    if verdict["all_gates_passed"]:
+        print("🎉 Всі обов'язкові критерії успішно пройдено!")
+        print("   Очищений корпус рекомендовано для переходу на 'Corpus v2-clean1'.\n")
+    else:
+        print("⚠️  Є непройдені критерії. Перехід наразі заблоковано.\n")
+
+    b_lib.close()
+    c_lib.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="korz",
@@ -1108,6 +1225,21 @@ def main() -> None:
     p_corp_eval.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
     p_corp_eval.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
 
+    p_corp_align = corp_sub.add_parser("align", help="Вирівняти ідентифікатори абзаців між baseline та clean candidate базами")
+    p_corp_align.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
+    p_corp_align.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
+
+    p_corp_ab = corp_sub.add_parser("ab-shadow", help="Порівняти видачу baseline та clean candidate на конкретному запиті")
+    p_corp_ab.add_argument("query", help="Пошуковий запит")
+    p_corp_ab.add_argument("--target", "--target-id", dest="target", type=int, help="Очікуваний paragraph_id у baseline")
+    p_corp_ab.add_argument("--limit", type=int, default=10, help="Кількість результатів (за замовчуванням: 10)")
+    p_corp_ab.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
+    p_corp_ab.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
+
+    p_corp_promo = corp_sub.add_parser("promotion-gate", help="Перевірити всі 6 критеріїв Promotion Gate для переходу на Corpus v2")
+    p_corp_promo.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
+    p_corp_promo.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1186,6 +1318,12 @@ def main() -> None:
                 cmd_corpus_build_candidate(args)
             elif args.corpus_command == "evaluate-ab":
                 cmd_corpus_evaluate_ab(args)
+            elif args.corpus_command == "align":
+                cmd_corpus_align(args)
+            elif args.corpus_command == "ab-shadow":
+                cmd_corpus_ab_shadow(args)
+            elif args.corpus_command == "promotion-gate":
+                cmd_corpus_promotion_gate(args)
             else:
                 p_corp.print_help()
     finally:

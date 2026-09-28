@@ -16,10 +16,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import sqlite3
+from types import SimpleNamespace
+
 # Ensure project root is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from korz_corpus import CorpusAuditor, CorpusCleaner, CorpusVerifier, CandidateLab, NoiseItem
+from korz_corpus import (
+    CorpusAuditor,
+    CorpusCleaner,
+    CorpusVerifier,
+    CandidateLab,
+    NoiseItem,
+    CorpusParagraphMap,
+    CorpusABShadowRunner,
+)
 
 
 class TestCorpusQualityPipeline(unittest.TestCase):
@@ -155,6 +166,182 @@ class TestCorpusQualityPipeline(unittest.TestCase):
             self.assertIn("REMOVE_HEADER", action_types)
             self.assertIn("SAFE_DEHYPHEN", action_types)
             self.assertIn("PRESERVE_COMPOUND_HYPHEN", action_types)
+
+
+
+class TestCorpusABAlignmentAndShadow(unittest.TestCase):
+    def test_paragraph_map_bidirectional_lookup(self):
+        """Verify CorpusParagraphMap accurately translates baseline and clean IDs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test_cand.sqlite"
+            conn = sqlite3.connect(db_path)
+            conn.execute("""
+            CREATE TABLE corpus_paragraph_map (
+                baseline_paragraph_id INTEGER PRIMARY KEY,
+                clean_paragraph_id INTEGER,
+                document_key TEXT,
+                baseline_document_id TEXT,
+                clean_document_id TEXT,
+                page_number INTEGER,
+                match_type TEXT,
+                similarity REAL,
+                confidence REAL,
+                baseline_text_preview TEXT,
+                clean_text_preview TEXT
+            );
+            """)
+            conn.execute("INSERT INTO corpus_paragraph_map VALUES (101, 201, 'book1', 'b1', 'c1', 1, 'exact_normalized', 1.0, 1.0, 'text', 'text');")
+            conn.execute("INSERT INTO corpus_paragraph_map VALUES (102, 202, 'book1', 'b1', 'c1', 1, 'minor_variation', 0.95, 0.95, 'text2', 'text2');")
+            conn.execute("INSERT INTO corpus_paragraph_map VALUES (103, NULL, 'book1', 'b1', 'c1', 1, 'deleted_ocr_noise', 0.0, 1.0, '10 • author', NULL);")
+            conn.commit()
+            conn.close()
+
+            pmap = CorpusParagraphMap(db_path)
+            # Baseline to Clean
+            self.assertEqual(pmap.get_clean_id(101), 201)
+            self.assertEqual(pmap.get_clean_id(102), 202)
+            self.assertIsNone(pmap.get_clean_id(103))
+            self.assertIsNone(pmap.get_clean_id(999))
+
+            # Clean to Baseline
+            self.assertEqual(pmap.get_baseline_id(201), 101)
+            self.assertEqual(pmap.get_baseline_id(202), 102)
+            self.assertIsNone(pmap.get_baseline_id(999))
+
+    def test_noise_detection(self):
+        """Verify is_noise_text detects digit lines and running headers."""
+        self.assertTrue(CorpusABShadowRunner.is_noise_text("14"))
+        self.assertTrue(CorpusABShadowRunner.is_noise_text("  xiv  "))
+        self.assertTrue(CorpusABShadowRunner.is_noise_text("10 • Роберт Сапольський"))
+        self.assertTrue(CorpusABShadowRunner.is_noise_text("Спогади примата — 25"))
+        self.assertFalse(CorpusABShadowRunner.is_noise_text("Бабуїни живуть у складній соціальній ієрархії."))
+
+    def test_ab_shadow_runner_evaluate_and_rank_lift(self):
+        """Verify shadow runner evaluation, noise counting, overlap, and rank lift."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test_cand.sqlite"
+            conn = sqlite3.connect(db_path)
+            conn.execute("""
+            CREATE TABLE corpus_paragraph_map (
+                baseline_paragraph_id INTEGER PRIMARY KEY,
+                clean_paragraph_id INTEGER
+            );
+            """)
+            conn.execute("INSERT INTO corpus_paragraph_map VALUES (10, 100);")
+            conn.execute("INSERT INTO corpus_paragraph_map VALUES (11, 101);")
+            conn.execute("INSERT INTO corpus_paragraph_map VALUES (12, 102);")
+            conn.commit()
+            conn.close()
+
+            pmap = CorpusParagraphMap(db_path)
+
+            class MockResult:
+                def __init__(self, pid, text, score=0.85):
+                    self.paragraph_id = pid
+                    self.text = text
+                    self.score = score
+
+            class MockLib:
+                def __init__(self, fts_results, sem_results):
+                    self._fts = fts_results
+                    self._sem = sem_results
+
+                def search(self, query, mode="fts", limit=10):
+                    return self._fts[:limit] if mode == "fts" else self._sem[:limit]
+
+            # Baseline has noise at #1 in FTS and target at #3
+            b_fts = [
+                MockResult(1, "12 • Заголовок"),
+                MockResult(2, "Випадковий абзац"),
+                MockResult(10, "Цільовий абзац про павіанів"),
+            ]
+            b_sem = [
+                MockResult(10, "Цільовий абзац про павіанів", 0.88),
+                MockResult(11, "Другий абзац", 0.84),
+            ]
+
+            # Clean has noise removed, target elevated to #1 in FTS
+            c_fts = [
+                MockResult(100, "Цільовий абзац про павіанів"),
+                MockResult(200, "Випадковий абзац"),
+            ]
+            c_sem = [
+                MockResult(100, "Цільовий абзац про павіанів", 0.89),
+                MockResult(101, "Другий абзац", 0.85),
+            ]
+
+            runner = CorpusABShadowRunner(
+                baseline_lib=MockLib(b_fts, b_sem),
+                candidate_lib=MockLib(c_fts, c_sem),
+                para_map=pmap,
+            )
+
+            res = runner.evaluate_query("павіани", target_baseline_id=10, top_k=5)
+
+            # Target baseline #10 mapped to clean #100
+            self.assertEqual(res["target_baseline_id"], 10)
+            self.assertEqual(res["target_clean_id"], 100)
+
+            # FTS rank improved from #3 to #1 (+2 lift)
+            self.assertEqual(res["baseline_fts_rank"], 3)
+            self.assertEqual(res["clean_fts_rank"], 1)
+            self.assertEqual(res["fts_rank_lift"], 2)
+
+            # Semantic rank stayed #1 (0 lift)
+            self.assertEqual(res["baseline_sem_rank"], 1)
+            self.assertEqual(res["clean_sem_rank"], 1)
+            self.assertEqual(res["sem_rank_lift"], 0)
+
+            # Noise metrics
+            self.assertEqual(res["baseline_noise_at_5"], 1)
+            self.assertEqual(res["clean_noise_at_5"], 0)
+
+            # Content Overlap@5: both 100 and 101 are matched (10->100, 11->101)
+            self.assertEqual(res["content_overlap_at_5_pct"], 100.0)
+
+    def test_promotion_gate_verdict(self):
+        """Verify Promotion Gate checks all operational & relevance criteria."""
+        class MockCandLib:
+            def __init__(self, admin_ok=True, sem_ok=True):
+                self._admin_ok = admin_ok
+                self._sem_ok = sem_ok
+
+            def admin_verify(self):
+                return {"all_healthy": self._admin_ok}
+
+            def verify_semantic_integrity(self, model_id=None):
+                return {"semantic_ready": self._sem_ok, "embeddings_present": 100, "total_chunks": 100}
+
+        runner = CorpusABShadowRunner(baseline_lib=None, candidate_lib=MockCandLib(True, True))
+
+        # PASS case (n>=30 triggers strict 10% regression threshold)
+        good_summary = {
+            "clean_noise_at_10_pct": 0.0,
+            "baseline_noise_at_10_pct": 5.0,
+            "regressed_pct": 0.0,
+            "median_semantic_rank_lift": 1,
+            "judged_queries": 100,
+        }
+        verdict = runner.check_promotion_gate(good_summary)
+        self.assertTrue(verdict["all_gates_passed"])
+        self.assertEqual(verdict["status"], "PASS")
+
+        # FAIL cases:
+        # 1. High clean noise
+        bad_noise = dict(good_summary, clean_noise_at_10_pct=3.5)
+        self.assertFalse(runner.check_promotion_gate(bad_noise)["all_gates_passed"])
+
+        # 2. Too many regressions (>10% with n>=30)
+        bad_reg = dict(good_summary, regressed_pct=15.0)
+        self.assertFalse(runner.check_promotion_gate(bad_reg)["all_gates_passed"])
+
+        # 3. Negative rank lift
+        bad_lift = dict(good_summary, median_semantic_rank_lift=-1)
+        self.assertFalse(runner.check_promotion_gate(bad_lift)["all_gates_passed"])
+
+        # 4. Corrupted candidate DB
+        corrupt_runner = CorpusABShadowRunner(baseline_lib=None, candidate_lib=MockCandLib(admin_ok=False))
+        self.assertFalse(corrupt_runner.check_promotion_gate(good_summary)["all_gates_passed"])
 
 
 if __name__ == "__main__":
