@@ -68,12 +68,13 @@ def mask_token(token: str) -> str:
 
 
 def load_env_config() -> dict:
-    """Read configuration from environment or .env file."""
+    """Read configuration from .env file first, falling back to os.environ."""
     config = {
-        "token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
-        "allowed_users": os.environ.get("ALLOWED_TELEGRAM_USERS", "").strip(),
+        "token": "",
+        "allowed_users": "",
     }
 
+    # 1. Load from .env file
     env_file = Path(".env")
     if env_file.exists():
         for line in env_file.read_text(encoding="utf-8").splitlines():
@@ -84,10 +85,16 @@ def load_env_config() -> dict:
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip().strip('"').strip("'")
-                if k == "TELEGRAM_BOT_TOKEN" and not config["token"]:
+                if k == "TELEGRAM_BOT_TOKEN" and v:
                     config["token"] = v
-                elif k == "ALLOWED_TELEGRAM_USERS" and not config["allowed_users"]:
+                elif k == "ALLOWED_TELEGRAM_USERS" and v:
                     config["allowed_users"] = v
+
+    # 2. Fallback to environment variables if not set in .env
+    if not config["token"]:
+        config["token"] = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
+    if not config["allowed_users"]:
+        config["allowed_users"] = os.environ.get("ALLOWED_TELEGRAM_USERS", "").strip().strip('"').strip("'")
 
     return config
 
