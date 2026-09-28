@@ -1701,6 +1701,47 @@ class KorzLibrary:
 
         return results
 
+    def ask(
+        self,
+        question: str,
+        limit: int = 5,
+        doc_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> List[SearchResult]:
+        """
+        Execute Question Retrieval (Semantic Concept / Thought Search) over the book library.
+        Finds the most conceptually relevant passages answering the question using dense vector embeddings (cosine similarity).
+        Bypasses global KORZ_SEMANTIC_ENABLED=0 constraint safely since this is an explicit question-answering intent.
+        """
+        if not question or not question.strip():
+            return []
+
+        clean_q = question.strip()
+        t0 = time.perf_counter()
+        results = self._search_semantic(
+            query=clean_q,
+            limit=limit,
+            doc_id=doc_id,
+            model_id=model_id,
+            internal_call=True,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        try:
+            top_id = results[0].paragraph_id if results else None
+            now_iso = datetime.now(timezone.utc).isoformat()
+            self.conn.execute(
+                """
+                INSERT INTO search_log (query, mode, result_count, top_result_id, latency_ms, created_at)
+                VALUES (?, 'ask', ?, ?, ?, ?)
+                """,
+                (clean_q[:250], len(results), top_id, round(elapsed_ms, 2), now_iso),
+            )
+        except Exception:
+            pass
+
+        return results
+
     def _search_exact(self, phrase: str, limit: int = 10, doc_id: Optional[str] = None) -> List[SearchResult]:
         """Exact case-insensitive literal substring search."""
         clean_phrase = TextProcessor.normalize_apostrophes(phrase.strip())

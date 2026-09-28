@@ -106,7 +106,45 @@ class TestBotHardening(unittest.TestCase):
                     f"Search failed for '{query}'"
                 )
 
+    def test_cmd_ask_empty_guidance(self):
+        """Verify calling /ask with no arguments presents clear usage instructions."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import bot
+
+        mock_msg = MagicMock()
+        mock_msg.from_user.id = 12345
+        mock_msg.text = "/ask"
+        mock_msg.answer = AsyncMock()
+
+        asyncio.run(bot.cmd_ask(mock_msg))
+        self.assertEqual(mock_msg.answer.call_count, 1)
+        sent_text = mock_msg.answer.call_args[0][0]
+        self.assertIn("/ask", sent_text)
+        self.assertIn("Смисловий пошук", sent_text)
+
+    def test_cmd_ask_question_retrieval(self):
+        """Verify calling /ask with a question returns semantic answers and feedback markup."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import bot
+        from korz_core import KorzLibrary
+
+        with KorzLibrary() as library:
+            bot.lib = library
+            mock_msg = MagicMock()
+            mock_msg.from_user.id = 12345
+            mock_msg.text = "/ask чому забезпечене життя не усуває стрес?"
+            mock_msg.answer = AsyncMock()
+
+            asyncio.run(bot.cmd_ask(mock_msg))
+            self.assertGreaterEqual(mock_msg.answer.call_count, 2)
+            sent_texts = [call[0][0] for call in mock_msg.answer.call_args_list]
+            self.assertTrue(any("Знайдено за змістом" in t for t in sent_texts))
+            self.assertFalse(any("Сталася помилка під час обробки" in t for t in sent_texts))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

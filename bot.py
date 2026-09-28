@@ -178,6 +178,7 @@ async def cmd_start(message: types.Message):
         "• Надішліть будь-яке слово або фразу: <code>бабуїни соціальний стрес</code>\n"
         "• Для точного пошуку фрази візьміть її в лапки: <code>«бабуїни працюють чотири години»</code>\n\n"
         "📚 <b>Команди:</b>\n"
+        "/ask &lt;питання&gt; — смисловий пошук думок (семантичний Question Retrieval)\n"
         "/books — список усіх книг у бібліотеці\n"
         "/status — стан та статистика бази даних\n"
         "/help — довідка та поради з пошуку",
@@ -193,15 +194,14 @@ async def cmd_help(message: types.Message):
     await message.answer(
         "📖 <b>Поради з пошуку в KORZ:</b>\n\n"
         "1. <b>Лексичний пошук (FTS5 / BM25):</b>\n"
-        "Введіть ключові слова через пробіл:\n"
-        "<code>ресурсоорієнтована економіка Фреско</code>\n"
-        "Бот знайде найбільш релевантні абзаци за алгоритмом BM25.\n\n"
+        "Надішліть ключові слова через пробіл: <code>бабуїни соціальний стрес</code>\n\n"
         "2. <b>Точний пошук фрази (Exact Match):</b>\n"
-        "Візьміть фразу в лапки:\n"
-        "<code>«структурний диференціал»</code> або <code>\"пам'ять\"</code>\n"
-        "Бот знайде абзаци, які містять саме цю послідовність слів.\n\n"
-        "3. <b>Контекст:</b>\n"
-        "Під кожним знайденим уривком є кнопка <b>[📖 Контекст (±2 абз.)]</b>, яка показує сусідні абзаци.",
+        "Візьміть фразу в лапки: <code>«структурний диференціал»</code>\n\n"
+        "3. <b>Смисловий пошук думок (/ask):</b>\n"
+        "Задайте питання або ідею людською мовою: <code>/ask Чому забезпечене життя не усуває стрес?</code>\n"
+        "Бот знайде уривки за схожістю змісту, навіть якщо слова повністю відрізняються.\n\n"
+        "4. <b>Контекст та оцінка:</b>\n"
+        "Під кожним знайденим уривком є <b>[📖 Контекст]</b> та <b>[🎯 Саме цей]</b>.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -310,6 +310,124 @@ async def cb_context(callback: types.CallbackQuery):
     except Exception as e:
         logger.exception(f"Error handling callback {callback.data}")
         await callback.answer("Помилка завантаження контексту", show_alert=True)
+
+
+@dp.message(Command("ask"))
+async def cmd_ask(message: types.Message):
+    if not await check_auth_or_reject(message):
+        return
+
+    raw_text = message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "🧠 <b>Смисловий пошук думок (/ask):</b>\n\n"
+            "Введіть питання людською мовою або концептуальну ідею після команди:\n"
+            "• <code>/ask Чому забезпечене життя не усуває стрес?</code>\n"
+            "• <code>/ask Де Коржибський говорить що карта не є територією?</code>\n"
+            "• <code>/ask Чому гроші можуть стати непотрібними у майбутньому?</code>\n\n"
+            "💡 <i>KORZ виконає векторний пошук за змістом (dense embeddings), знаходячи відповідні уривки, навіть якщо слова повністю відрізняються.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    question = parts[1].strip()
+    if len(question) > MAX_QUERY_LENGTH:
+        await message.answer(
+            f"⚠️ <b>Питання занадто довге</b> ({len(question)} символів).\n"
+            f"Максимальна дозволена довжина: {MAX_QUERY_LENGTH} символів.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        t0 = time.perf_counter()
+        results = lib.ask(question, limit=3)
+        latency_sem = (time.perf_counter() - t0) * 1000
+
+        # Background shadow FTS comparison for telemetry
+        if lib.config.shadow_enabled and shadow_runner:
+            fts_t0 = time.perf_counter()
+            fts_res = lib.search(question, mode="fts", limit=3, shadow=False)
+            latency_fts = (time.perf_counter() - fts_t0) * 1000
+            asyncio.create_task(
+                shadow_runner.evaluate_async(
+                    query=f"[ask] {question}",
+                    fts_results=fts_res,
+                    latency_fts_ms=latency_fts,
+                )
+            )
+
+        if not results:
+            clean_q = html.escape(question)
+            await message.answer(
+                f"🧠 За змістом для «<b>{clean_q}</b>» у книгах нічого не знайдено.\n\n"
+                "💡 <i>Спробуйте переформулювати запитання або уточнити контекст.</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        clean_q = html.escape(question)
+        intro = (
+            f"🧠 <b>Знайдено за змістом: {len(results)}</b> "
+            f"({latency_sem:.0f} ms для «{clean_q}»):\n"
+        )
+        await message.answer(intro, parse_mode=ParseMode.HTML)
+
+        for i, r in enumerate(results, 1):
+            author_str = f"{html.escape(r.author)} — " if r.author else ""
+            title_str = html.escape(r.title)
+            sanitized_text = html.escape(r.text)
+
+            if len(sanitized_text) > 850:
+                sanitized_text = sanitized_text[:840] + "..."
+
+            msg_text = (
+                f"📚 <b>{author_str}{title_str}</b>\n"
+                f"📄 Сторінка <b>{r.page}</b> (абзац {r.paragraph_index}) [ID: {r.paragraph_id}]\n"
+                f"🎯 Смислова відповідність: <b>{r.score:.3f}</b>\n\n"
+                f"{sanitized_text}"
+            )
+
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📖 Контекст (±2 абз.)",
+                            callback_data=f"ctx:{r.paragraph_id}:2",
+                        ),
+                        InlineKeyboardButton(
+                            text="🎯 Саме цей",
+                            callback_data=f"fb:tgt:{r.paragraph_id}",
+                        ),
+                    ]
+                ]
+            )
+
+            await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        fb_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="👍 Знайшов",
+                        callback_data=f"fb:up:{results[0].paragraph_id if results else 0}",
+                    ),
+                    InlineKeyboardButton(
+                        text="👎 Не те",
+                        callback_data="fb:dn:0",
+                    ),
+                ]
+            ]
+        )
+        await message.answer("💡 <i>Оцініть точність знайденої відповіді:</i>", reply_markup=fb_kb, parse_mode=ParseMode.HTML)
+
+    except Exception as e:
+        logger.exception(f"Error handling /ask query: '{question}'")
+        await message.answer(
+            "❌ Сталася помилка під час обробки смислового запиту. Спробуйте пізніше або переформулюйте.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @dp.message()

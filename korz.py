@@ -118,6 +118,48 @@ def cmd_search(args, lib: KorzLibrary) -> None:
     print()
 
 
+def cmd_ask(args, lib: KorzLibrary) -> None:
+    question = args.question.strip() if args.question else ""
+    if not question:
+        print("❌ Помилка: вкажіть питання або концептуальну фразу.")
+        print("   Приклад: python korz.py ask \"чому забезпечене життя не усуває стрес?\"")
+        return
+
+    limit = getattr(args, "limit", 5)
+    doc_id = getattr(args, "doc", None)
+
+    try:
+        t0 = time.perf_counter()
+        results = lib.ask(question, limit=limit, doc_id=doc_id)
+        latency = (time.perf_counter() - t0) * 1000
+
+        if not results:
+            print(f"\n🧠 За змістом для «{question}» нічого не знайдено.")
+            print("💡 Спробуйте переформулювати запитання або перевірте стан семантичного індексу.\n")
+            return
+
+        print("\n" + "=" * 65)
+        print(f"🧠 KORZ Question Retrieval (Семантична відповідність за {latency:.1f} ms)")
+        print("=" * 65)
+        print(f"❓ Питання: «{question}»\n" + "─" * 65)
+
+        for i, r in enumerate(results, 1):
+            author_str = f"{r.author} — " if r.author else ""
+            print(f"\n[{i}] 📚 {author_str}{r.title}")
+            print(f"    📄 Сторінка {r.page} (абзац {r.paragraph_index}) [ID: {r.paragraph_id}]")
+            print(f"    🎯 Смислова схожість (cosine): {r.score:.4f}")
+            print("    " + "─" * 45)
+            indented = "    " + r.text.strip().replace("\n", "\n    ")
+            if len(indented) > 600:
+                indented = indented[:590] + "..."
+            print(f"    «{indented.strip()}»")
+            print("─" * 65)
+
+        print("=" * 65 + "\n")
+    except RuntimeError as e:
+        print(f"\n❌ {e}\n")
+
+
 def cmd_show(args, lib: KorzLibrary) -> None:
     par_id = args.id
     ctx = lib.get_context(par_id, window=args.context)
@@ -601,6 +643,12 @@ def main() -> None:
     p_search.add_argument("--limit", type=int, default=10, help="Максимальна кількість результатів (за замовчуванням: 10)")
     p_search.add_argument("--doc", help="Фільтр за ID книги")
 
+    # ask (Question Retrieval / Concept search)
+    p_ask = subparsers.add_parser("ask", help="Семантичний пошук уривків, що відповідають на смислове питання (Question Retrieval)")
+    p_ask.add_argument("question", help="Питання або концептуальний запит")
+    p_ask.add_argument("--limit", "-n", type=int, default=5, help="Кількість результатів (за замовчуванням: 5)")
+    p_ask.add_argument("--doc", help="Фільтр за ID книги")
+
     # show
     p_show = subparsers.add_parser("show", help="Показати абзац та розширений контекст")
     p_show.add_argument("id", type=int, help="ID абзацу (paragraph_id)")
@@ -693,6 +741,8 @@ def main() -> None:
             cmd_find(args, lib)
         elif args.command == "search":
             cmd_search(args, lib)
+        elif args.command == "ask":
+            cmd_ask(args, lib)
         elif args.command == "show":
             cmd_show(args, lib)
         elif args.command == "books":
