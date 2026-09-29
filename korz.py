@@ -1024,7 +1024,7 @@ def cmd_corpus_ab_shadow(args) -> None:
 
 def cmd_corpus_promotion_gate(args) -> None:
     from korz_core import KorzLibrary, KorzConfig
-    from korz_corpus import CorpusParagraphMap, CorpusABShadowRunner
+    from korz_corpus import CorpusParagraphMap, CorpusABShadowRunner, GroundTruthToolkit
 
     baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
     candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
@@ -1033,9 +1033,10 @@ def cmd_corpus_promotion_gate(args) -> None:
     c_lib = KorzLibrary(KorzConfig(db_path=candidate_path, semantic_enabled=True))
     pmap = CorpusParagraphMap(candidate_path)
     runner = CorpusABShadowRunner(b_lib, c_lib, pmap)
+    gt_toolkit = GroundTruthToolkit(baseline_path, candidate_path)
+    gt_status = gt_toolkit.get_status()
 
-    # ── REGRESSION SET ──
-    # target = baseline known-good result (checks nothing important broke)
+    # ── REGRESSION SET (Safety baseline only, not counted in GT) ──
     regression_benchmarks = [
         {"query": "стрес і соціальна ієрархія", "target_id": 7033},
         {"query": "бабуїни павіани агресія кортизол", "target_id": 12345},
@@ -1047,9 +1048,7 @@ def cmd_corpus_promotion_gate(args) -> None:
         {"query": "мова наука та розсудливість не-арістотелівські системи", "target_id": 5067},
     ]
 
-    # ── NOISE CHALLENGE SET ──
-    # Queries designed to provoke noise results (chapter names, author names,
-    # page numbers, short ambiguous terms, header-like phrases)
+    # ── NOISE CHALLENGE SET (Noise suppression test only) ──
     noise_challenge_queries = [
         {"query": "Сапольський", "target_id": None},
         {"query": "Спогади примата", "target_id": None},
@@ -1069,13 +1068,13 @@ def cmd_corpus_promotion_gate(args) -> None:
     print("🛡️  KORZ Corpus v2 Clean Promotion Gate")
     print("=" * 65)
 
-    print("\n📋 Regression Benchmark (n={})...".format(len(regression_benchmarks)))
+    print(f"\n📋 Regression Benchmark (n={len(regression_benchmarks)})...")
     summary = runner.run_benchmark(regression_benchmarks, top_k=10)
 
-    print("📋 Noise Challenge Set (n={})...".format(len(noise_challenge_queries)))
+    print(f"📋 Noise Challenge Set (n={len(noise_challenge_queries)})...")
     noise_summary = runner.run_benchmark(noise_challenge_queries, top_k=10)
 
-    verdict = runner.check_promotion_gate(summary, noise_challenge_summary=noise_summary)
+    verdict = runner.check_promotion_gate(summary, noise_challenge_summary=noise_summary, ground_truth_summary=gt_status)
 
     # ── Display Tiered Verdict ──
     print("\n" + "─" * 65)
@@ -1093,14 +1092,20 @@ def cmd_corpus_promotion_gate(args) -> None:
         print(f"  {icon} {g['name']:<30} : {g['detail']}")
 
     print("\n" + "─" * 65)
-    print("📊 EVIDENCE STATUS")
+    print("📊 EVIDENCE STATUS (Human 🎯 Ground Truth)")
     print("─" * 65)
-    n = verdict["judged_queries"]
-    n_min = verdict["min_queries_for_promotion"]
-    ev_icon = "✅" if verdict["sufficient_evidence"] else "🟡"
-    print(f"  {ev_icon} {'Judged queries':<30} : {n} / {n_min} minimum")
-    if not verdict["sufficient_evidence"]:
-        print(f"     ℹ️  {n_min - n} додаткових ground-truth запитів потрібно для повного PASS")
+    n_gt = gt_status["unique_valid_queries"]
+    n_min = gt_status["promotion_minimum"]
+    mapped = gt_status["mapped_to_clean"]
+    total_lbl = gt_status["human_labels"]
+
+    print(f"  • Human 🎯 target labels     : {total_lbl}")
+    print(f"  • Unique valid queries        : {n_gt} / {n_min} minimum")
+    print(f"  • Mapped to Clean corpus      : {mapped} / {total_lbl}")
+    print(f"  • Regression targets          : {len(regression_benchmarks)} (safety baseline only, not counted in GT)")
+    print(f"  • Noise challenge queries     : {len(noise_challenge_queries)} (noise suppression test only)")
+    if gt_status["remaining"] > 0:
+        print(f"  ℹ️  {gt_status['remaining']} додаткових унікальних 🎯 запитів потрібно для повного PASS")
 
     print("\n" + "=" * 65)
     status = verdict["status"]
@@ -1111,7 +1116,7 @@ def cmd_corpus_promotion_gate(args) -> None:
         print(f"🟡 Статус: [{status}]")
         print("   Технічні критерії пройдені. Retrieval-критерії пройдені попередньо.")
         print("   ⏸  HOLD — недостатньо ground-truth для production promotion.")
-        print(f"   Потрібно: {n_min}+ 🎯 запитів з людською розміткою.")
+        print(f"   Потрібно: {n_min}+ 🎯 унікальних запитів з людською розміткою (зараз: {n_gt}).")
     else:
         print(f"❌ Статус: [{status}]")
         print("   Є непройдені критерії. Перехід заблоковано.")
@@ -1119,6 +1124,108 @@ def cmd_corpus_promotion_gate(args) -> None:
 
     b_lib.close()
     c_lib.close()
+
+
+def cmd_ground_truth_status(args) -> None:
+    from korz_corpus import GroundTruthToolkit
+    baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
+    candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
+
+    gt = GroundTruthToolkit(baseline_path, candidate_path)
+    st = gt.get_status()
+
+    print("\n" + "=" * 60)
+    print("🎯 KORZ Ground Truth Status")
+    print("=" * 60)
+    print(f"Human target labels:      {st['human_labels']}")
+    print(f"Unique queries:           {st['unique_queries']}")
+    print(f"Mapped to Clean corpus:   {st['mapped_to_clean']} / {st['human_labels']}")
+    print(f"Ambiguous mappings:       {st['ambiguous_mappings']}")
+    print(f"Missing mappings:         {st['missing_mappings']}")
+    print("─" * 60)
+    print(f"Search:                   {st['by_mode']['search']}")
+    print(f"Ask:                      {st['by_mode']['ask']}")
+    print(f"Answer:                   {st['by_mode']['answer']}")
+    print("─" * 60)
+    print(f"Promotion minimum:        {st['promotion_minimum']}")
+    print(f"Remaining:                {st['remaining']}")
+    print("=" * 60 + "\n")
+
+
+def cmd_ground_truth_validate(args) -> None:
+    from korz_corpus import GroundTruthToolkit
+    baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
+    candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
+
+    gt = GroundTruthToolkit(baseline_path, candidate_path)
+    res = gt.validate()
+
+    print("\n" + "=" * 65)
+    print("🔍 KORZ Ground Truth Validation Report")
+    print("=" * 65)
+    print(f"Всього розмічених записів: {res['total']}")
+    print(f"Валідні для промоції:     {res['valid_count']} (унікальних: {res['summary']['unique_valid_queries']})")
+    print(f"Проблемні / відхилені:    {res['invalid_count']}")
+    print("─" * 65)
+
+    if res['invalid']:
+        print("⚠️  Список проблемних записів (не будуть враховані для Gate):")
+        for item in res['invalid']:
+            print(f"  • ID #{item['id']} [Mode: {item['mode']}] Query: «{item['query']}»")
+            print(f"    Target #{item['baseline_paragraph_id']} -> Clean #{item['clean_paragraph_id']}")
+            print(f"    Причина: {item['validation_issue']}")
+        print("─" * 65)
+
+    if res['valid']:
+        print(f"✅ Валідні записи ({len(res['valid'])}):")
+        for item in res['valid'][:10]:
+            print(f"  • ID #{item['id']} [Mode: {item['mode']}] Query: «{item['query']}»")
+            print(f"    Baseline #{item['baseline_paragraph_id']} -> Clean #{item['clean_paragraph_id']} ({item['match_type']}, sim={item['similarity']:.2f})")
+        if len(res['valid']) > 10:
+            print(f"    ... ще {len(res['valid']) - 10} записів.")
+    else:
+        print("ℹ️  Поки немає валідних розмічених записів. Використовуйте бота або 'python korz.py ground-truth add'.")
+
+    print("=" * 65 + "\n")
+
+
+def cmd_ground_truth_export(args) -> None:
+    from korz_corpus import GroundTruthToolkit
+    baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
+    candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
+    out_path = Path(args.out) if getattr(args, "out", None) else None
+
+    gt = GroundTruthToolkit(baseline_path, candidate_path)
+    json_str = gt.export(out_path)
+
+    if out_path:
+        print(f"\n✅ Ground Truth експортовано у файл: {out_path} ({len(gt.get_labels())} записів)\n")
+    else:
+        print(json_str)
+
+
+def cmd_ground_truth_add(args) -> None:
+    from korz_corpus import GroundTruthToolkit
+    baseline_path = Path(getattr(args, "baseline", None) or "data/korz_library.sqlite")
+    candidate_path = Path(getattr(args, "candidate", None) or "data/korz_clean_candidate.sqlite")
+
+    gt = GroundTruthToolkit(baseline_path, candidate_path)
+    item = gt.add_label(
+        query=args.query,
+        baseline_paragraph_id=args.target_id,
+        mode=args.mode,
+        source="cli",
+        user_id=getattr(args, "user", "manual"),
+        comment=getattr(args, "comment", None),
+    )
+
+    clean_str = f"#{item['clean_paragraph_id']}" if item['clean_paragraph_id'] else "None (Unmatched)"
+    sim_str = f"sim={item['similarity']:.2f}" if item['similarity'] else "no match"
+    print("\n✅ Ground Truth мітку успішно додано:")
+    print(f"  Query:         «{item['query']}» (Fingerprint: {item['fingerprint']})")
+    print(f"  Mode:          {item['mode']}")
+    print(f"  Baseline PID:  #{item['baseline_paragraph_id']}")
+    print(f"  Clean PID:     {clean_str} ({item['match_type']}, {sim_str})\n")
 
 
 
@@ -1295,6 +1402,32 @@ def main() -> None:
     p_corp_promo.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
     p_corp_promo.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
 
+    # ground-truth (Ground Truth Management & Validation)
+    p_gt = subparsers.add_parser("ground-truth", help="Керування, валідація та експорт Human Ground Truth (🎯)")
+    gt_sub = p_gt.add_subparsers(dest="gt_command")
+
+    p_gt_status = gt_sub.add_parser("status", help="Статус накопичення людського ground truth")
+    p_gt_status.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
+    p_gt_status.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
+
+    p_gt_validate = gt_sub.add_parser("validate", help="Крос-корпусна валідація міток ground truth через CorpusParagraphMap")
+    p_gt_validate.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
+    p_gt_validate.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
+
+    p_gt_export = gt_sub.add_parser("export", help="Експорт розміченого ground truth у формат JSON")
+    p_gt_export.add_argument("--out", help="Шлях до файлу для збереження JSON")
+    p_gt_export.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
+    p_gt_export.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
+
+    p_gt_add = gt_sub.add_parser("add", help="Вручну додати цільову мітку 🎯 (ground truth label)")
+    p_gt_add.add_argument("query", help="Пошуковий запит або питання")
+    p_gt_add.add_argument("target_id", type=int, help="ID правильного абзацу в baseline базі (paragraph_id)")
+    p_gt_add.add_argument("--mode", default="search", choices=["search", "ask", "answer"], help="Режим пошуку")
+    p_gt_add.add_argument("--user", default="manual", help="Ідентифікатор користувача або джерела")
+    p_gt_add.add_argument("--comment", help="Коментар або примітка")
+    p_gt_add.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")
+    p_gt_add.add_argument("--candidate", default="data/korz_clean_candidate.sqlite", help="Шлях до candidate бази")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1381,6 +1514,17 @@ def main() -> None:
                 cmd_corpus_promotion_gate(args)
             else:
                 p_corp.print_help()
+        elif args.command == "ground-truth":
+            if args.gt_command == "status":
+                cmd_ground_truth_status(args)
+            elif args.gt_command == "validate":
+                cmd_ground_truth_validate(args)
+            elif args.gt_command == "export":
+                cmd_ground_truth_export(args)
+            elif args.gt_command == "add":
+                cmd_ground_truth_add(args)
+            else:
+                p_gt.print_help()
     finally:
         lib.close()
 

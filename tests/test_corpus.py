@@ -30,6 +30,8 @@ from korz_corpus import (
     NoiseItem,
     CorpusParagraphMap,
     CorpusABShadowRunner,
+    GroundTruthToolkit,
+    GroundTruthItem,
 )
 
 
@@ -368,6 +370,122 @@ class TestCorpusABAlignmentAndShadow(unittest.TestCase):
         sem_gate = [g for g in verdict["technical_gates"] if g["name"] == "Semantic Index Integrity"][0]
         self.assertIn("100/100", sem_gate["detail"])
 
+        # 7. Ground Truth Evidence Gate: Human GT decouples from regression benchmark
+        # Case A: Human GT insufficient (n=5 < 30) -> PROVISIONAL PASS
+        gt_insufficient = {"human_labels": 7, "unique_valid_queries": 5, "promotion_minimum": 30}
+        verdict_gt_hold = runner.check_promotion_gate(good_summary, ground_truth_summary=gt_insufficient)
+        self.assertFalse(verdict_gt_hold["sufficient_evidence"])
+        self.assertEqual(verdict_gt_hold["status"], "PROVISIONAL PASS")
+        self.assertEqual(verdict_gt_hold["judged_queries"], 5)
+
+        # Case B: Human GT sufficient (n=30 >= 30) -> FULL PASS
+        gt_sufficient = {"human_labels": 35, "unique_valid_queries": 30, "promotion_minimum": 30}
+        verdict_gt_pass = runner.check_promotion_gate(good_summary, ground_truth_summary=gt_sufficient)
+        self.assertTrue(verdict_gt_pass["sufficient_evidence"])
+        self.assertEqual(verdict_gt_pass["status"], "PASS")
+        self.assertEqual(verdict_gt_pass["judged_queries"], 30)
+
+    def test_ground_truth_fingerprint_dedup_and_status(self):
+        """Verify query fingerprinting prevents artificial inflation of n on repeated queries."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cand_db = Path(tmpdir) / "cand.sqlite"
+            base_db = Path(tmpdir) / "base.sqlite"
+
+            # Init minimal map in candidate db
+            conn = sqlite3.connect(cand_db)
+            conn.execute("""
+            CREATE TABLE corpus_paragraph_map (
+                baseline_paragraph_id INTEGER PRIMARY KEY,
+                clean_paragraph_id INTEGER,
+                match_type TEXT,
+                similarity REAL
+            );
+            """)
+            conn.execute("INSERT INTO corpus_paragraph_map VALUES (101, 201, 'exact_normalized', 1.0);")
+            conn.execute("INSERT INTO corpus_paragraph_map VALUES (102, 202, 'minor_variation', 0.95);")
+            conn.commit()
+            conn.close()
+
+            # Init minimal baseline db
+            b_conn = sqlite3.connect(base_db)
+            b_conn.execute("CREATE TABLE paragraphs (id INTEGER PRIMARY KEY, display_text TEXT);")
+            b_conn.execute("INSERT INTO paragraphs VALUES (101, 'Текст про соціальний статус.');")
+            b_conn.execute("INSERT INTO paragraphs VALUES (102, 'Текст про ієрархію приматів.');")
+            b_conn.commit()
+            b_conn.close()
+
+            gt = GroundTruthToolkit(base_db, cand_db)
+
+            # User asks same question 3 times and clicks target each time
+            gt.add_label("Чому соціальний статус впливає на здоров'я?", 101, mode="ask")
+            gt.add_label("чому соціальний статус впливає на здоров'я? ", 101, mode="ask")
+            gt.add_label("Чому  соціальний статус впливає на здоров'я?", 101, mode="ask")
+
+            # Different query
+            gt.add_label("ієрархія приматів", 102, mode="search")
+
+            st = gt.get_status()
+            # Total feedback clicks = 2 distinct records stored (UNIQUE INDEX on fingerprint + pid)
+            self.assertEqual(st["unique_queries"], 2)
+            self.assertEqual(st["unique_valid_queries"], 2)
+            self.assertEqual(st["mapped_to_clean"], 2)
+            self.assertEqual(st["by_mode"]["ask"], 1)
+            self.assertEqual(st["by_mode"]["search"], 1)
+            self.assertEqual(st["remaining"], 28)
+
+    def test_ground_truth_validation_and_export(self):
+        """Verify GroundTruthToolkit filters deleted/ambiguous noise and exports JSON cleanly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cand_db = Path(tmpdir) / "cand.sqlite"
+            base_db = Path(tmpdir) / "base.sqlite"
+
+            c_conn = sqlite3.connect(cand_db)
+            c_conn.execute("""
+            CREATE TABLE corpus_paragraph_map (
+                baseline_paragraph_id INTEGER PRIMARY KEY,
+                clean_paragraph_id INTEGER,
+                match_type TEXT,
+                similarity REAL
+            );
+            """)
+            c_conn.execute("INSERT INTO corpus_paragraph_map VALUES (1, 10, 'exact_normalized', 1.0);")
+            c_conn.execute("INSERT INTO corpus_paragraph_map VALUES (2, NULL, 'deleted_ocr_noise', 0.0);")
+            c_conn.execute("INSERT INTO corpus_paragraph_map VALUES (3, 30, 'unmatched_other', 0.50);")
+            c_conn.commit()
+            c_conn.close()
+
+            b_conn = sqlite3.connect(base_db)
+            b_conn.execute("CREATE TABLE paragraphs (id INTEGER PRIMARY KEY, display_text TEXT);")
+            b_conn.execute("INSERT INTO paragraphs VALUES (1, 'Змістовний текст.');")
+            b_conn.execute("INSERT INTO paragraphs VALUES (2, '12 • Роберт Сапольський');")
+            b_conn.execute("INSERT INTO paragraphs VALUES (3, 'Неясний текст.');")
+            b_conn.commit()
+            b_conn.close()
+
+            gt = GroundTruthToolkit(base_db, cand_db)
+            gt.add_label("валідний запит", 1, mode="search")
+            gt.add_label("запит на шум", 2, mode="search")
+            gt.add_label("неоднозначний запит", 3, mode="search")
+
+            val = gt.validate()
+            self.assertEqual(val["total"], 3)
+            self.assertEqual(val["valid_count"], 1)
+            self.assertEqual(val["invalid_count"], 2)
+
+            # Check reasons for invalidation
+            issues = {item["validation_issue"] for item in val["invalid"]}
+            self.assertTrue(any("OCR layout noise" in iss for iss in issues))
+            self.assertTrue(any("Ambiguous" in iss for iss in issues))
+
+            # Test JSON Export
+            export_file = Path(tmpdir) / "gt_export.json"
+            json_str = gt.export(export_file)
+            self.assertTrue(export_file.exists())
+            data = json.loads(json_str)
+            self.assertEqual(data["count"], 3)
+            self.assertIn("exported_at", data)
+
 
 if __name__ == "__main__":
     unittest.main()
+

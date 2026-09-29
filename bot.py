@@ -20,13 +20,14 @@ Usage:
 import argparse
 import asyncio
 import html
+import json
 import logging
 import os
 import re
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 # Ensure UTF-8 output on Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -52,6 +53,7 @@ dp = Dispatcher()
 lib: Optional[KorzLibrary] = None
 shadow_runner: Optional[ShadowRunner] = None
 ALLOWED_USERS: Set[int] = set()
+_last_user_query: Dict[str, Tuple[str, str]] = {}
 
 MAX_QUERY_LENGTH = 500
 MAX_TELEGRAM_MSG_LEN = 3900
@@ -343,6 +345,9 @@ async def cmd_ask(message: types.Message):
         )
         return
 
+    if message.from_user:
+        _last_user_query[str(message.from_user.id)] = (question, "ask")
+
     try:
         t0 = time.perf_counter()
         results = lib.ask(question, limit=3)
@@ -473,6 +478,9 @@ async def cmd_answer(message: types.Message):
         )
         return
 
+    if message.from_user:
+        _last_user_query[str(message.from_user.id)] = (question, "answer")
+
     try:
         t0 = time.perf_counter()
         res = lib.answer(question)
@@ -566,6 +574,9 @@ async def handle_query(message: types.Message):
     query = raw_query.strip()
     if not query:
         return
+
+    if message.from_user:
+        _last_user_query[str(message.from_user.id)] = (query, "search")
 
     # Check query length limit
     if len(query) > MAX_QUERY_LENGTH:
@@ -676,10 +687,23 @@ async def cb_feedback(callback: types.CallbackQuery):
             target_pid = None
 
         query_text = ""
+        mode = "search"
         if callback.message and callback.message.reply_to_message and callback.message.reply_to_message.text:
-            query_text = callback.message.reply_to_message.text.strip()
+            raw = callback.message.reply_to_message.text.strip()
+            if raw.startswith("/ask"):
+                query_text = raw[4:].strip()
+                mode = "ask"
+            elif raw.startswith("/answer"):
+                query_text = raw[7:].strip()
+                mode = "answer"
+            else:
+                query_text = raw
+                mode = "search"
 
         user_str = str(callback.from_user.id)
+        if not query_text and user_str in _last_user_query:
+            query_text, mode = _last_user_query[user_str]
+
         type_map = {
             "tgt": "target",
             "up": "found",
@@ -691,11 +715,13 @@ async def cb_feedback(callback: types.CallbackQuery):
         canonical_type = type_map.get(fb_type, "found")
 
         if lib:
+            comment_json = json.dumps({"mode": mode})
             lib.record_feedback(
                 query=query_text or "telegram_query",
                 feedback_type=canonical_type,
                 target_paragraph_id=target_pid,
                 user_id=user_str,
+                comment=comment_json,
             )
 
         if fb_type == "tgt":

@@ -1269,6 +1269,7 @@ class CorpusABShadowRunner:
         self,
         benchmark_summary: Dict[str, Any],
         noise_challenge_summary: Optional[Dict[str, Any]] = None,
+        ground_truth_summary: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Validates promotion gates with tiered verdict before switching production:
@@ -1283,9 +1284,13 @@ class CorpusABShadowRunner:
           R3. Median Semantic Rank Lift >= 0
           R4. Noise Challenge Set (optional, when provided)
 
+        EVIDENCE GATE (provenance: strictly Human 🎯 ground truth):
+          - Only unique valid human target queries count towards the 30 minimum.
+          - Regression Set is safety only; Noise Challenge is noise test only.
+
         Overall verdict:
-          PASS              — all gates pass, n >= 30
-          PROVISIONAL PASS  — all gates pass, n < 30
+          PASS              — all gates pass, human judged queries >= 30
+          PROVISIONAL PASS  — all gates pass, human judged queries < 30 (HOLD)
           BLOCKED           — any gate fails
         """
         technical_gates = []
@@ -1356,7 +1361,16 @@ class CorpusABShadowRunner:
         # ── Combine into tiered verdict ──
         all_technical = all(g["passed"] for g in technical_gates)
         all_retrieval = all(g["passed"] for g in retrieval_gates)
-        sufficient_evidence = n_judged >= 30
+
+        # Evidence Sufficiency: Strictly Human Ground Truth (unique judged queries)
+        if ground_truth_summary is not None:
+            human_judged = ground_truth_summary.get("unique_valid_queries", 0)
+            min_queries = ground_truth_summary.get("promotion_minimum", 30)
+        else:
+            human_judged = n_judged
+            min_queries = 30
+
+        sufficient_evidence = human_judged >= min_queries
 
         if all_technical and all_retrieval and sufficient_evidence:
             status = "PASS"
@@ -1369,11 +1383,339 @@ class CorpusABShadowRunner:
             "status": status,
             "all_gates_passed": all_technical and all_retrieval,
             "sufficient_evidence": sufficient_evidence,
-            "judged_queries": n_judged,
-            "min_queries_for_promotion": 30,
+            "judged_queries": human_judged,
+            "min_queries_for_promotion": min_queries,
             "technical_gates": technical_gates,
             "retrieval_gates": retrieval_gates,
-            # Legacy compat
             "gates": technical_gates + retrieval_gates,
         }
+
+
+@dataclass
+class GroundTruthItem:
+    id: int
+    query: str
+    normalized_query: str
+    query_fingerprint: str
+    mode: str
+    baseline_paragraph_id: int
+    clean_paragraph_id: Optional[int]
+    match_type: Optional[str]
+    similarity: float
+    source: str
+    user_id: Optional[str]
+    comment: Optional[str]
+    created_at: str
+    is_valid_for_promotion: bool
+    validation_issue: Optional[str] = None
+    baseline_preview: str = ""
+    clean_preview: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class GroundTruthToolkit:
+    """
+    Manages human ground truth (🎯 target labels) across Baseline and Clean Candidate corpora.
+    Ensures:
+      - Provenance tracking (search_feedback vs manual vs CLI)
+      - Query fingerprinting: SHA256(normalized_query + mode), COUNT(DISTINCT fingerprint)
+      - Strict cross-corpus validation: only unambiguous mappings (clean_id != None, similarity >= 0.78)
+        are eligible for promotion gating.
+    """
+
+    def __init__(self, baseline_db: Path, candidate_db: Path):
+        self.baseline_db = Path(baseline_db).resolve()
+        self.candidate_db = Path(candidate_db).resolve()
+        self._init_db()
+        self.para_map = CorpusParagraphMap(self.candidate_db)
+
+    def _init_db(self) -> None:
+        """Ensure ground_truth_labels table exists in candidate_db."""
+        conn = sqlite3.connect(self.candidate_db)
+        try:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS ground_truth_labels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT NOT NULL,
+                normalized_query TEXT NOT NULL,
+                query_fingerprint TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'search',
+                baseline_paragraph_id INTEGER NOT NULL,
+                clean_paragraph_id INTEGER,
+                match_type TEXT,
+                similarity REAL DEFAULT 0.0,
+                source TEXT NOT NULL DEFAULT 'search_feedback',
+                user_id TEXT,
+                comment TEXT,
+                created_at TEXT NOT NULL
+            );
+            """)
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gt_fp_pid ON ground_truth_labels(query_fingerprint, baseline_paragraph_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_gt_mode ON ground_truth_labels(mode);")
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def compute_fingerprint(query: str, mode: str = "search") -> Tuple[str, str]:
+        """Returns (normalized_query, sha256_fingerprint[:16])."""
+        norm = re.sub(r"\s+", " ", query).strip().lower()
+        fp = hashlib.sha256(f"{norm}:{mode}".encode("utf-8")).hexdigest()[:16]
+        return norm, fp
+
+    def sync_from_feedback(self) -> int:
+        """
+        Syncs human target labels from search_feedback in baseline_db into ground_truth_labels.
+        Excludes synthetic/test queries. Resolves mappings via CorpusParagraphMap.
+        """
+        if not self.baseline_db.exists():
+            return 0
+
+        b_conn = sqlite3.connect(f"file:{self.baseline_db}?mode=ro", uri=True)
+        try:
+            has_table = b_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_feedback'").fetchone()
+            if not has_table:
+                return 0
+
+            rows = b_conn.execute("""
+                SELECT id, query, target_paragraph_id, feedback_type, user_id, comment, created_at
+                FROM search_feedback
+                WHERE target_paragraph_id IS NOT NULL
+                  AND feedback_type IN ('target', 'found', 'answer_accurate', 'answer_partial')
+                  AND query != 'telegram_query'
+                  AND query NOT LIKE 'тест %'
+            """).fetchall()
+        finally:
+            b_conn.close()
+
+        if not rows:
+            return 0
+
+        c_conn = sqlite3.connect(self.candidate_db)
+        imported = 0
+        try:
+            for fb_id, raw_q, pid, fb_type, uid, comment, created_at in rows:
+                q = raw_q.strip()
+                mode = "search"
+                if comment and "mode" in comment:
+                    try:
+                        mode = json.loads(comment).get("mode", "search")
+                    except Exception:
+                        pass
+                elif fb_type in ("answer_accurate", "answer_partial"):
+                    mode = "answer"
+                elif q.startswith("/ask"):
+                    mode = "ask"
+                    q = q[4:].strip()
+                elif q.startswith("/answer"):
+                    mode = "answer"
+                    q = q[7:].strip()
+
+                norm_q, fp = self.compute_fingerprint(q, mode)
+
+                clean_id = self.para_map.get_clean_id(pid)
+                map_info = c_conn.execute(
+                    "SELECT match_type, similarity FROM corpus_paragraph_map WHERE baseline_paragraph_id=?",
+                    (pid,)
+                ).fetchone()
+                mtype = map_info[0] if map_info else None
+                sim = map_info[1] if map_info else 0.0
+
+                cur = c_conn.execute("""
+                    INSERT OR IGNORE INTO ground_truth_labels
+                    (query, normalized_query, query_fingerprint, mode, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'search_feedback', ?, ?, ?)
+                """, (q, norm_q, fp, mode, pid, clean_id, mtype, sim, uid, comment, created_at))
+                if cur.rowcount > 0:
+                    imported += 1
+            c_conn.commit()
+        finally:
+            c_conn.close()
+
+        return imported
+
+    def add_label(
+        self,
+        query: str,
+        baseline_paragraph_id: int,
+        mode: str = "search",
+        source: str = "cli",
+        user_id: Optional[str] = None,
+        comment: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Manually records a human ground-truth target label."""
+        q = query.strip()
+        norm_q, fp = self.compute_fingerprint(q, mode)
+        clean_id = self.para_map.get_clean_id(baseline_paragraph_id)
+
+        c_conn = sqlite3.connect(self.candidate_db)
+        try:
+            map_info = c_conn.execute(
+                "SELECT match_type, similarity FROM corpus_paragraph_map WHERE baseline_paragraph_id=?",
+                (baseline_paragraph_id,)
+            ).fetchone()
+            mtype = map_info[0] if map_info else None
+            sim = map_info[1] if map_info else 0.0
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            c_conn.execute("""
+                INSERT OR REPLACE INTO ground_truth_labels
+                (query, normalized_query, query_fingerprint, mode, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (q, norm_q, fp, mode, baseline_paragraph_id, clean_id, mtype, sim, source, user_id, comment, now_iso))
+            c_conn.commit()
+        finally:
+            c_conn.close()
+
+        return {
+            "query": q,
+            "fingerprint": fp,
+            "mode": mode,
+            "baseline_paragraph_id": baseline_paragraph_id,
+            "clean_paragraph_id": clean_id,
+            "match_type": mtype,
+            "similarity": sim,
+        }
+
+    def get_labels(self) -> List[GroundTruthItem]:
+        """Loads and validates all ground truth labels against corpus paragraphs."""
+        self.sync_from_feedback()
+
+        c_conn = sqlite3.connect(f"file:{self.candidate_db}?mode=ro", uri=True)
+        b_conn = sqlite3.connect(f"file:{self.baseline_db}?mode=ro", uri=True) if self.baseline_db.exists() else None
+
+        items = []
+        try:
+            rows = c_conn.execute("""
+                SELECT id, query, normalized_query, query_fingerprint, mode, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at
+                FROM ground_truth_labels
+                ORDER BY id ASC
+            """).fetchall()
+
+            has_b_para = bool(b_conn and b_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paragraphs'").fetchone())
+            has_c_para = bool(c_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paragraphs'").fetchone())
+
+            for r in rows:
+                (lid, query, norm_q, fp, mode, b_id, c_id, mtype, sim, src, uid, comment, created_at) = r
+
+                b_prev = ""
+                if has_b_para:
+                    b_row = b_conn.execute("SELECT display_text FROM paragraphs WHERE id=?", (b_id,)).fetchone()
+                    b_prev = b_row[0][:100] if b_row else ""
+
+                c_prev = ""
+                if has_c_para and c_id:
+                    c_row = c_conn.execute("SELECT display_text FROM paragraphs WHERE id=?", (c_id,)).fetchone()
+                    c_prev = c_row[0][:100] if c_row else ""
+
+                is_valid = True
+                issue = None
+                if mtype == "deleted_ocr_noise":
+                    is_valid = False
+                    issue = "Target is OCR layout noise (deleted in clean corpus)"
+                elif c_id is None:
+                    is_valid = False
+                    issue = "Missing mapping in clean candidate (NULL)"
+                elif mtype == "unmatched_other" or sim < 0.78:
+                    is_valid = False
+                    issue = f"Ambiguous cross-corpus mapping (similarity {sim:.2f} < 0.78)"
+
+                items.append(GroundTruthItem(
+                    id=lid,
+                    query=query,
+                    normalized_query=norm_q,
+                    query_fingerprint=fp,
+                    mode=mode,
+                    baseline_paragraph_id=b_id,
+                    clean_paragraph_id=c_id,
+                    match_type=mtype,
+                    similarity=round(sim, 4),
+                    source=src,
+                    user_id=uid,
+                    comment=comment,
+                    created_at=created_at,
+                    is_valid_for_promotion=is_valid,
+                    validation_issue=issue,
+                    baseline_preview=b_prev,
+                    clean_preview=c_prev,
+                ))
+        finally:
+            c_conn.close()
+            if b_conn:
+                b_conn.close()
+
+        return items
+
+    def get_status(self) -> Dict[str, Any]:
+        """Calculates ground truth metrics and readiness for promotion gate."""
+        labels = self.get_labels()
+        total_labels = len(labels)
+        unique_fps = set(l.query_fingerprint for l in labels)
+        unique_queries = len(unique_fps)
+
+        valid_labels = [l for l in labels if l.is_valid_for_promotion]
+        unique_valid = len(set(l.query_fingerprint for l in valid_labels))
+
+        mapped_count = sum(1 for l in labels if l.clean_paragraph_id is not None and l.match_type != "deleted_ocr_noise")
+        ambiguous_count = sum(1 for l in labels if l.match_type == "unmatched_other" or (l.clean_paragraph_id and l.similarity < 0.78))
+        missing_count = sum(1 for l in labels if l.clean_paragraph_id is None or l.match_type == "deleted_ocr_noise")
+
+        by_mode = {"search": 0, "ask": 0, "answer": 0}
+        for l in labels:
+            m = l.mode.lower()
+            if m in by_mode:
+                by_mode[m] += 1
+            else:
+                by_mode["search"] += 1
+
+        prom_min = 30
+        remaining = max(0, prom_min - unique_valid)
+
+        return {
+            "human_labels": total_labels,
+            "unique_queries": unique_queries,
+            "unique_valid_queries": unique_valid,
+            "mapped_to_clean": mapped_count,
+            "ambiguous_mappings": ambiguous_count,
+            "missing_mappings": missing_count,
+            "by_mode": by_mode,
+            "promotion_minimum": prom_min,
+            "remaining": remaining,
+            "is_ready_for_promotion": unique_valid >= prom_min,
+            "labels": labels,
+        }
+
+    def validate(self) -> Dict[str, Any]:
+        """Detailed validation report of all ground truth entries."""
+        status = self.get_status()
+        labels = status["labels"]
+        valid = [l.to_dict() for l in labels if l.is_valid_for_promotion]
+        invalid = [l.to_dict() for l in labels if not l.is_valid_for_promotion]
+
+        return {
+            "total": len(labels),
+            "valid_count": len(valid),
+            "invalid_count": len(invalid),
+            "valid": valid,
+            "invalid": invalid,
+            "summary": status,
+        }
+
+    def export(self, output_path: Optional[Path] = None) -> str:
+        """Exports ground truth data to JSON."""
+        labels = [l.to_dict() for l in self.get_labels()]
+        payload = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "count": len(labels),
+            "labels": labels,
+        }
+        json_str = json.dumps(payload, ensure_ascii=False, indent=2)
+        if output_path:
+            p = Path(output_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json_str, encoding="utf-8")
+        return json_str
+
 
