@@ -184,6 +184,22 @@ class TestAnswerEngine(unittest.TestCase):
         self.assertIn("answer_partial", types)
         self.assertIn("answer_accurate", types)
 
+    def test_gemini_generative_answer_mocked(self):
+        """Verify Gemini backend formats prompt, runs agy, and verifies citations."""
+        from unittest.mock import patch, MagicMock
+        cfg = AnswerConfig(enabled=True, backend="gemini", min_similarity=0.75, gemini_model="gemini-3.8-flash-low")
+        engine = AnswerEngine(self.lib, cfg)
+
+        mock_sub = MagicMock()
+        mock_sub.returncode = 0
+        mock_sub.stdout = "Бабуїни хворіють через стрес [1].".encode("utf-8")
+
+        with patch("subprocess.run", return_value=mock_sub):
+            res = engine.answer("Чому соціальний статус впливає на здоров'я?")
+            self.assertEqual(res.mode, "gemini")
+            self.assertIn("[1]", res.answer_text)
+            self.assertEqual(len(res.sources), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

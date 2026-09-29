@@ -73,7 +73,8 @@ class AnswerResult:
 class AnswerConfig:
     """Configuration for AnswerEngine."""
     enabled: bool = False
-    backend: str = "extractive"  # 'extractive' | 'ollama' | 'auto'
+    backend: str = "extractive"  # 'extractive' | 'gemini' | 'ollama' | 'auto'
+    gemini_model: str = "gemini-3.8-flash-low"
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.2:3b"
     min_similarity: float = 0.82
@@ -85,6 +86,7 @@ class AnswerConfig:
         return cls(
             enabled=os.environ.get("KORZ_ANSWER_ENABLED", "0").strip() in ("1", "true", "True"),
             backend=os.environ.get("KORZ_ANSWER_BACKEND", "extractive").strip().lower(),
+            gemini_model=os.environ.get("KORZ_GEMINI_MODEL", "gemini-3.8-flash-low").strip(),
             ollama_url=os.environ.get("KORZ_OLLAMA_URL", "http://localhost:11434").strip(),
             ollama_model=os.environ.get("KORZ_OLLAMA_MODEL", "llama3.2:3b").strip(),
             min_similarity=float(os.environ.get("KORZ_ANSWER_MIN_SIMILARITY", "0.82")),
@@ -175,7 +177,9 @@ class AnswerEngine:
             )
 
         # 4. Dispatch to requested answering strategy
-        if target_mode == "generative" or (target_mode == "auto" and self._is_ollama_ready()):
+        if target_mode in ("gemini", "agy_gemini") or (target_mode == "auto" and self._is_agy_ready()):
+            res = self._generative_gemini_answer(clean_q, sources)
+        elif target_mode == "generative" or (target_mode == "auto" and self._is_ollama_ready()):
             res = self._generative_llm_answer(clean_q, sources)
         else:
             res = self._extractive_answer(clean_q, sources)
@@ -379,4 +383,88 @@ class AnswerEngine:
                 return len(models) > 0
         except Exception:
             return False
+
+    def _is_agy_ready(self) -> bool:
+        """Check if local agy CLI binary is available on PATH."""
+        import shutil
+        return shutil.which("agy") is not None
+
+    def _generative_gemini_answer(self, question: str, sources: List[AnswerSource]) -> AnswerResult:
+        """
+        Generative Answering via local Antigravity CLI (Gemini 3.8 Flash Low)
+        without requiring external API keys.
+        Strict citation contract with automated Citation Verification Pass.
+        Falls back to extractive mode if agy fails or citations are invalid.
+        """
+        import subprocess
+
+        # Prepare context blocks with clear citation markers
+        context_blocks = []
+        for s in sources:
+            author_str = f"{s.author} — " if s.author else ""
+            context_blocks.append(
+                f"[{s.citation_index}] ДЖЕРЕЛО: {author_str}«{s.title}», стор. {s.page}\n«{s.text}»"
+            )
+        context_text = "\n\n".join(context_blocks)
+
+        prompt = (
+            "Ти — точний помічник локальної бібліотеки KORZ.\n"
+            "Твоє завдання — надати чітку відповідь на запитання користувача ВИКЛЮЧНО на основі наведених нижче джерел з книг.\n\n"
+            "СУВОРІ ПРАВИЛА:\n"
+            "1. Відповідай спираючись ТІЛЬКИ на факти з наданих фрагментів. Не додавай нічого від себе і не вигадуй фактів.\n"
+            "2. Обов'язково вказуй номери джерел [1], [2] після кожного твердження чи факту.\n"
+            "3. Якщо в наданих текстах немає прямої відповіді, прямо напиши: "
+            "\"У наданих джерелах недостатньо інформації для відповіді на це питання.\"\n"
+            "4. Відповідай українською мовою лаконічно (2-4 речення) та по суті.\n\n"
+            f"ФРАГМЕНТИ З КНИГ:\n{context_text}\n\n"
+            f"ЗАПИТАННЯ: {question}\n\n"
+            "ВІДПОВІДЬ ЗА ДЖЕРЕЛАМИ:"
+        )
+
+        fallback_reason = None
+        try:
+            cmd = ["agy", "--model", self.config.gemini_model, "-p", prompt]
+            res = subprocess.run(cmd, capture_output=True, timeout=35)
+            if res.returncode == 0:
+                generated = res.stdout.decode("utf-8", errors="replace").strip()
+                if generated:
+                    if "недостатньо інформації" in generated.lower():
+                        return AnswerResult(
+                            question=question,
+                            answer_text=generated,
+                            sources=sources[:2],
+                            mode="gemini",
+                            is_grounded=True,
+                            insufficient_info=True,
+                        )
+
+                    verified_text, used_sources, unsupported_cnt, is_valid = self._verify_and_filter_citations(
+                        generated, sources
+                    )
+                    if is_valid:
+                        return AnswerResult(
+                            question=question,
+                            answer_text=verified_text,
+                            sources=used_sources,
+                            mode="gemini",
+                            is_grounded=True,
+                            unsupported_claims_count=unsupported_cnt,
+                        )
+                    else:
+                        fallback_reason = "Gemini повернула текст без валідних посилань на джерела"
+                else:
+                    fallback_reason = "Gemini повернула порожню відповідь"
+            else:
+                err_msg = res.stderr.decode("utf-8", errors="replace").strip()
+                fallback_reason = f"agy CLI завершився з кодом {res.returncode}: {err_msg[:100]}"
+        except Exception as e:
+            fallback_reason = f"Помилка виклику agy ({e.__class__.__name__})"
+            logger.warning(f"Gemini answer via agy failed: {e}; falling back to extractive.")
+
+        # Fallback to extractive
+        res = self._extractive_answer(question, sources)
+        res.fallback_reason = fallback_reason or "Gemini fallback"
+        res.error = fallback_reason
+        return res
+
 
