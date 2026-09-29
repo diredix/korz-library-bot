@@ -881,6 +881,22 @@ async def main():
         masked = mask_token(token)
         logger.info(f"🤖 KORZ Telegram Bot успішно підключено: @{bot_info.username} (Token: {masked})")
         logger.info("📚 Підключено до локальної бібліотеки SQLite. Очікування запитів...")
+
+        # Register interactive commands for Telegram UI autocomplete (/...)
+        try:
+            bot_commands = [
+                types.BotCommand(command="answer", description="Синтез відповіді за книгами (Gemini 3.8 Flash)"),
+                types.BotCommand(command="ask", description="Семантичний пошук ідей та думок (E5)"),
+                types.BotCommand(command="search", description="Текстовий пошук за точними словами"),
+                types.BotCommand(command="books", description="Каталог книг у бібліотеці"),
+                types.BotCommand(command="status", description="Стан бібліотеки та семантичного індексу"),
+                types.BotCommand(command="help", description="Довідка щодо роботи з ботом"),
+            ]
+            await bot.set_my_commands(bot_commands)
+            logger.info("📋 Команди бота успішно зареєстровано в Telegram (автодоповнення при введенні /)")
+        except Exception as ce:
+            logger.warning(f"⚠️ Не вдалося зареєструвати команди бота в Telegram: {ce}")
+
         await dp.start_polling(bot)
     finally:
         lib.close()
