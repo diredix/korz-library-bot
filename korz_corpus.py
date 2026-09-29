@@ -1398,15 +1398,17 @@ class GroundTruthItem:
     normalized_query: str
     query_fingerprint: str
     mode: str
+    doc_scope: str
     baseline_paragraph_id: int
     clean_paragraph_id: Optional[int]
     match_type: Optional[str]
     similarity: float
     source: str
-    user_id: Optional[str]
-    comment: Optional[str]
-    created_at: str
-    is_valid_for_promotion: bool
+    search_run_id: Optional[int] = None
+    user_id: Optional[str] = None
+    comment: Optional[str] = None
+    created_at: str = ""
+    is_valid_for_promotion: bool = True
     validation_issue: Optional[str] = None
     baseline_preview: str = ""
     clean_preview: str = ""
@@ -1420,7 +1422,8 @@ class GroundTruthToolkit:
     Manages human ground truth (🎯 target labels) across Baseline and Clean Candidate corpora.
     Ensures:
       - Provenance tracking (search_feedback vs manual vs CLI)
-      - Query fingerprinting: SHA256(normalized_query + mode), COUNT(DISTINCT fingerprint)
+      - Search run binding (immutable search_run_id / answer_run_id)
+      - Query fingerprinting: SHA256(normalized_query + ":" + mode + ":" + doc_scope), COUNT(DISTINCT fingerprint)
       - Strict cross-corpus validation: only unambiguous mappings (clean_id != None, similarity >= 0.78)
         are eligible for promotion gating.
     """
@@ -1442,6 +1445,8 @@ class GroundTruthToolkit:
                 normalized_query TEXT NOT NULL,
                 query_fingerprint TEXT NOT NULL,
                 mode TEXT NOT NULL DEFAULT 'search',
+                doc_scope TEXT NOT NULL DEFAULT 'ALL',
+                search_run_id INTEGER,
                 baseline_paragraph_id INTEGER NOT NULL,
                 clean_paragraph_id INTEGER,
                 match_type TEXT,
@@ -1454,21 +1459,33 @@ class GroundTruthToolkit:
             """)
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_gt_fp_pid ON ground_truth_labels(query_fingerprint, baseline_paragraph_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_gt_mode ON ground_truth_labels(mode);")
+
+            # Safe column migration if table previously existed
+            try:
+                cols = [c[1] for c in conn.execute("PRAGMA table_info(ground_truth_labels)").fetchall()]
+                if "doc_scope" not in cols:
+                    conn.execute("ALTER TABLE ground_truth_labels ADD COLUMN doc_scope TEXT NOT NULL DEFAULT 'ALL';")
+                if "search_run_id" not in cols:
+                    conn.execute("ALTER TABLE ground_truth_labels ADD COLUMN search_run_id INTEGER;")
+            except Exception:
+                pass
+
             conn.commit()
         finally:
             conn.close()
 
     @staticmethod
-    def compute_fingerprint(query: str, mode: str = "search") -> Tuple[str, str]:
-        """Returns (normalized_query, sha256_fingerprint[:16])."""
-        norm = re.sub(r"\s+", " ", query).strip().lower()
-        fp = hashlib.sha256(f"{norm}:{mode}".encode("utf-8")).hexdigest()[:16]
-        return norm, fp
+    def compute_fingerprint(query: str, mode: str = "search", doc_scope: str = "ALL") -> Tuple[str, str]:
+        """Returns (normalized_query, sha256_fingerprint[:16]) including doc_scope."""
+        norm_q = re.sub(r"\s+", " ", query).strip().lower()
+        norm_scope = (doc_scope or "ALL").strip().upper()
+        fp = hashlib.sha256(f"{norm_q}:{mode}:{norm_scope}".encode("utf-8")).hexdigest()[:16]
+        return norm_q, fp
 
     def sync_from_feedback(self) -> int:
         """
         Syncs human target labels from search_feedback in baseline_db into ground_truth_labels.
-        Excludes synthetic/test queries. Resolves mappings via CorpusParagraphMap.
+        Excludes synthetic/test queries. Resolves mappings via CorpusParagraphMap and historical search runs.
         """
         if not self.baseline_db.exists():
             return 0
@@ -1479,14 +1496,36 @@ class GroundTruthToolkit:
             if not has_table:
                 return 0
 
-            rows = b_conn.execute("""
-                SELECT id, query, target_paragraph_id, feedback_type, user_id, comment, created_at
-                FROM search_feedback
-                WHERE target_paragraph_id IS NOT NULL
-                  AND feedback_type IN ('target', 'found', 'answer_accurate', 'answer_partial')
-                  AND query != 'telegram_query'
-                  AND query NOT LIKE 'тест %'
-            """).fetchall()
+            # Check if search_run_id is a column in search_feedback
+            cur_cols = [c[1] for c in b_conn.execute("PRAGMA table_info(search_feedback)").fetchall()]
+            has_run_id = "search_run_id" in cur_cols
+
+            if has_run_id:
+                sql = """
+                    SELECT id, query, target_paragraph_id, feedback_type, user_id, comment, created_at, search_run_id
+                    FROM search_feedback
+                    WHERE target_paragraph_id IS NOT NULL
+                      AND feedback_type IN ('target', 'found', 'answer_accurate', 'answer_partial')
+                      AND query != 'telegram_query'
+                      AND query NOT LIKE 'тест %'
+                """
+            else:
+                sql = """
+                    SELECT id, query, target_paragraph_id, feedback_type, user_id, comment, created_at, NULL as search_run_id
+                    FROM search_feedback
+                    WHERE target_paragraph_id IS NOT NULL
+                      AND feedback_type IN ('target', 'found', 'answer_accurate', 'answer_partial')
+                      AND query != 'telegram_query'
+                      AND query NOT LIKE 'тест %'
+                """
+
+            rows = b_conn.execute(sql).fetchall()
+
+            has_search_runs = bool(b_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_runs'").fetchone())
+            runs_cache: Dict[int, Tuple[str, str, str]] = {}
+            if has_search_runs:
+                for r_id, r_q, r_m, r_s in b_conn.execute("SELECT id, query, mode, doc_scope FROM search_runs").fetchall():
+                    runs_cache[r_id] = (r_q, r_m, r_s or "ALL")
         finally:
             b_conn.close()
 
@@ -1496,24 +1535,36 @@ class GroundTruthToolkit:
         c_conn = sqlite3.connect(self.candidate_db)
         imported = 0
         try:
-            for fb_id, raw_q, pid, fb_type, uid, comment, created_at in rows:
+            for fb_id, raw_q, pid, fb_type, uid, comment, created_at, s_run_id in rows:
                 q = raw_q.strip()
                 mode = "search"
-                if comment and "mode" in comment:
+                doc_scope = "ALL"
+
+                # Check immutable search run first
+                if s_run_id and s_run_id in runs_cache:
+                    run_q, run_m, run_s = runs_cache[s_run_id]
+                    q = run_q
+                    mode = run_m
+                    doc_scope = run_s
+                elif comment:
                     try:
-                        mode = json.loads(comment).get("mode", "search")
+                        c_dict = json.loads(comment)
+                        mode = c_dict.get("mode", mode)
+                        doc_scope = c_dict.get("doc_scope", doc_scope)
                     except Exception:
                         pass
-                elif fb_type in ("answer_accurate", "answer_partial"):
-                    mode = "answer"
-                elif q.startswith("/ask"):
-                    mode = "ask"
-                    q = q[4:].strip()
-                elif q.startswith("/answer"):
-                    mode = "answer"
-                    q = q[7:].strip()
 
-                norm_q, fp = self.compute_fingerprint(q, mode)
+                if mode == "search":
+                    if fb_type in ("answer_accurate", "answer_partial"):
+                        mode = "answer"
+                    elif q.startswith("/ask"):
+                        mode = "ask"
+                        q = q[4:].strip()
+                    elif q.startswith("/answer"):
+                        mode = "answer"
+                        q = q[7:].strip()
+
+                norm_q, fp = self.compute_fingerprint(q, mode, doc_scope)
 
                 clean_id = self.para_map.get_clean_id(pid)
                 map_info = c_conn.execute(
@@ -1525,9 +1576,9 @@ class GroundTruthToolkit:
 
                 cur = c_conn.execute("""
                     INSERT OR IGNORE INTO ground_truth_labels
-                    (query, normalized_query, query_fingerprint, mode, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'search_feedback', ?, ?, ?)
-                """, (q, norm_q, fp, mode, pid, clean_id, mtype, sim, uid, comment, created_at))
+                    (query, normalized_query, query_fingerprint, mode, doc_scope, search_run_id, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'search_feedback', ?, ?, ?)
+                """, (q, norm_q, fp, mode, doc_scope, s_run_id, pid, clean_id, mtype, sim, uid, comment, created_at))
                 if cur.rowcount > 0:
                     imported += 1
             c_conn.commit()
@@ -1541,13 +1592,15 @@ class GroundTruthToolkit:
         query: str,
         baseline_paragraph_id: int,
         mode: str = "search",
+        doc_scope: str = "ALL",
+        search_run_id: Optional[int] = None,
         source: str = "cli",
         user_id: Optional[str] = None,
         comment: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Manually records a human ground-truth target label."""
         q = query.strip()
-        norm_q, fp = self.compute_fingerprint(q, mode)
+        norm_q, fp = self.compute_fingerprint(q, mode, doc_scope)
         clean_id = self.para_map.get_clean_id(baseline_paragraph_id)
 
         c_conn = sqlite3.connect(self.candidate_db)
@@ -1562,9 +1615,9 @@ class GroundTruthToolkit:
 
             c_conn.execute("""
                 INSERT OR REPLACE INTO ground_truth_labels
-                (query, normalized_query, query_fingerprint, mode, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (q, norm_q, fp, mode, baseline_paragraph_id, clean_id, mtype, sim, source, user_id, comment, now_iso))
+                (query, normalized_query, query_fingerprint, mode, doc_scope, search_run_id, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (q, norm_q, fp, mode, doc_scope.strip().upper(), search_run_id, baseline_paragraph_id, clean_id, mtype, sim, source, user_id, comment, now_iso))
             c_conn.commit()
         finally:
             c_conn.close()
@@ -1573,6 +1626,8 @@ class GroundTruthToolkit:
             "query": q,
             "fingerprint": fp,
             "mode": mode,
+            "doc_scope": doc_scope.strip().upper(),
+            "search_run_id": search_run_id,
             "baseline_paragraph_id": baseline_paragraph_id,
             "clean_paragraph_id": clean_id,
             "match_type": mtype,
@@ -1589,7 +1644,7 @@ class GroundTruthToolkit:
         items = []
         try:
             rows = c_conn.execute("""
-                SELECT id, query, normalized_query, query_fingerprint, mode, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at
+                SELECT id, query, normalized_query, query_fingerprint, mode, doc_scope, search_run_id, baseline_paragraph_id, clean_paragraph_id, match_type, similarity, source, user_id, comment, created_at
                 FROM ground_truth_labels
                 ORDER BY id ASC
             """).fetchall()
@@ -1598,7 +1653,7 @@ class GroundTruthToolkit:
             has_c_para = bool(c_conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='paragraphs'").fetchone())
 
             for r in rows:
-                (lid, query, norm_q, fp, mode, b_id, c_id, mtype, sim, src, uid, comment, created_at) = r
+                (lid, query, norm_q, fp, mode, scope, s_run_id, b_id, c_id, mtype, sim, src, uid, comment, created_at) = r
 
                 b_prev = ""
                 if has_b_para:
@@ -1628,6 +1683,8 @@ class GroundTruthToolkit:
                     normalized_query=norm_q,
                     query_fingerprint=fp,
                     mode=mode,
+                    doc_scope=scope or "ALL",
+                    search_run_id=s_run_id,
                     baseline_paragraph_id=b_id,
                     clean_paragraph_id=c_id,
                     match_type=mtype,

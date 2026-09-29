@@ -382,6 +382,19 @@ async def cmd_ask(message: types.Message):
         )
         await message.answer(intro, parse_mode=ParseMode.HTML)
 
+        top_pid = results[0].paragraph_id if results else None
+        run_id = 0
+        if lib:
+            run_id = lib.record_search_run(
+                query=question,
+                mode="ask",
+                doc_scope="ALL",
+                result_count=len(results),
+                top_paragraph_id=top_pid,
+                latency_ms=latency_sem,
+                user_id=str(message.from_user.id) if message.from_user else None,
+            )
+
         for i, r in enumerate(results, 1):
             author_str = f"{html.escape(r.author)} — " if r.author else ""
             title_str = html.escape(r.title)
@@ -406,7 +419,7 @@ async def cmd_ask(message: types.Message):
                         ),
                         InlineKeyboardButton(
                             text="🎯 Саме цей",
-                            callback_data=f"fb:tgt:{r.paragraph_id}",
+                            callback_data=f"fb:tgt:{run_id}:{r.paragraph_id}",
                         ),
                     ]
                 ]
@@ -419,11 +432,11 @@ async def cmd_ask(message: types.Message):
                 [
                     InlineKeyboardButton(
                         text="👍 Знайшов",
-                        callback_data=f"fb:up:{results[0].paragraph_id if results else 0}",
+                        callback_data=f"fb:up:{run_id}:{top_pid if top_pid else 0}",
                     ),
                     InlineKeyboardButton(
                         text="👎 Не те",
-                        callback_data="fb:dn:0",
+                        callback_data=f"fb:dn:{run_id}:0",
                     ),
                 ]
             ]
@@ -486,6 +499,31 @@ async def cmd_answer(message: types.Message):
         res = lib.answer(question)
         latency = (time.perf_counter() - t0) * 1000
 
+        search_run_id = 0
+        ans_run_id = 0
+        if lib:
+            search_run_id = lib.record_search_run(
+                query=question,
+                mode="answer",
+                doc_scope="ALL",
+                result_count=len(res.sources),
+                top_paragraph_id=res.sources[0].paragraph_id if res.sources else None,
+                latency_ms=latency,
+                user_id=str(message.from_user.id) if message.from_user else None,
+            )
+            ans_run_id = lib.record_answer_run(
+                query=question,
+                backend=res.mode,
+                threshold=getattr(getattr(lib, "config", None), "answer_min_similarity", 0.82),
+                insufficient_info=1 if res.insufficient_info else 0,
+                source_paragraph_ids=[s.paragraph_id for s in res.sources],
+                answer_text=res.answer_text,
+                citation_verified=1 if res.is_grounded else 0,
+                latency_ms=latency,
+                search_run_id=search_run_id,
+                user_id=str(message.from_user.id) if message.from_user else None,
+            )
+
         if res.insufficient_info:
             clean_ans = html.escape(res.answer_text)
             await message.answer(
@@ -525,7 +563,7 @@ async def cmd_answer(message: types.Message):
                 ),
                 InlineKeyboardButton(
                     text=f"🎯 Саме цей [{s.citation_index}]",
-                    callback_data=f"fb:tgt:{s.paragraph_id}",
+                    callback_data=f"fb:tgt:{search_run_id}:{s.paragraph_id}",
                 ),
             ])
 
@@ -536,21 +574,20 @@ async def cmd_answer(message: types.Message):
             chunk_kb = kb if i == len(chunks) - 1 else None
             await message.answer(chunk, reply_markup=chunk_kb, parse_mode=ParseMode.HTML)
 
-        target_pid = res.sources[0].paragraph_id if res.sources else 0
         fb_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
                         text="👍 Відповідь точна",
-                        callback_data=f"fb:ans_up:{target_pid}",
+                        callback_data=f"fb:ans_up:{ans_run_id}",
                     ),
                     InlineKeyboardButton(
                         text="⚠️ Частково",
-                        callback_data=f"fb:ans_part:{target_pid}",
+                        callback_data=f"fb:ans_part:{ans_run_id}",
                     ),
                     InlineKeyboardButton(
                         text="👎 Не відповідає",
-                        callback_data="fb:ans_dn:0",
+                        callback_data=f"fb:ans_dn:{ans_run_id}",
                     ),
                 ]
             ]
@@ -617,6 +654,19 @@ async def handle_query(message: types.Message):
         intro = f"🔎 <b>Знайдено уривків: {len(results)}</b> ({mode_label} для «{clean_q}»):\n"
         await message.answer(intro, parse_mode=ParseMode.HTML)
 
+        top_pid = results[0].paragraph_id if results else None
+        run_id = 0
+        if lib:
+            run_id = lib.record_search_run(
+                query=query,
+                mode="search",
+                doc_scope="ALL",
+                result_count=len(results),
+                top_paragraph_id=top_pid,
+                latency_ms=latency_fts,
+                user_id=str(message.from_user.id) if message.from_user else None,
+            )
+
         for i, r in enumerate(results, 1):
             author_str = f"{html.escape(r.author)} — " if r.author else ""
             title_str = html.escape(r.title)
@@ -641,7 +691,7 @@ async def handle_query(message: types.Message):
                         ),
                         InlineKeyboardButton(
                             text="🎯 Саме цей",
-                            callback_data=f"fb:tgt:{r.paragraph_id}",
+                            callback_data=f"fb:tgt:{run_id}:{r.paragraph_id}",
                         ),
                     ]
                 ]
@@ -655,11 +705,11 @@ async def handle_query(message: types.Message):
                 [
                     InlineKeyboardButton(
                         text="👍 Знайшов",
-                        callback_data=f"fb:up:{results[0].paragraph_id if results else 0}",
+                        callback_data=f"fb:up:{run_id}:{top_pid if top_pid else 0}",
                     ),
                     InlineKeyboardButton(
                         text="👎 Не те",
-                        callback_data="fb:dn:0",
+                        callback_data=f"fb:dn:{run_id}:0",
                     ),
                 ]
             ]
@@ -681,28 +731,67 @@ async def cb_feedback(callback: types.CallbackQuery):
 
     try:
         parts = callback.data.split(":")
-        fb_type = parts[1]  # 'tgt', 'up', 'dn'
-        target_pid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-        if target_pid == 0:
-            target_pid = None
+        fb_type = parts[1]  # 'tgt', 'up', 'dn', 'ans_up', 'ans_part', 'ans_dn'
 
+        search_run_id: Optional[int] = None
+        answer_run_id: Optional[int] = None
+        target_pid: Optional[int] = None
         query_text = ""
         mode = "search"
-        if callback.message and callback.message.reply_to_message and callback.message.reply_to_message.text:
-            raw = callback.message.reply_to_message.text.strip()
-            if raw.startswith("/ask"):
-                query_text = raw[4:].strip()
-                mode = "ask"
-            elif raw.startswith("/answer"):
-                query_text = raw[7:].strip()
-                mode = "answer"
-            else:
-                query_text = raw
-                mode = "search"
+        doc_scope = "ALL"
 
-        user_str = str(callback.from_user.id)
-        if not query_text and user_str in _last_user_query:
-            query_text, mode = _last_user_query[user_str]
+        if fb_type in ("tgt", "up", "dn"):
+            # New format: fb:tgt:<run_id>:<pid>
+            # Legacy format: fb:tgt:<pid>
+            if len(parts) >= 4:
+                search_run_id = int(parts[2]) if parts[2].isdigit() else None
+                target_pid = int(parts[3]) if parts[3].isdigit() else None
+            elif len(parts) == 3:
+                target_pid = int(parts[2]) if parts[2].isdigit() else None
+
+            if target_pid == 0:
+                target_pid = None
+
+            if search_run_id and lib:
+                run = lib.get_search_run(search_run_id)
+                if run:
+                    query_text = run.get("query", "")
+                    mode = run.get("mode", "search")
+                    doc_scope = run.get("doc_scope", "ALL")
+
+        elif fb_type.startswith("ans_"):
+            # New format: fb:ans_up:<ans_run_id>
+            # Legacy format: fb:ans_up:<target_pid>
+            raw_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+            if raw_id and lib:
+                ans_run = lib.get_answer_run(raw_id)
+                if ans_run:
+                    answer_run_id = raw_id
+                    query_text = ans_run.get("query", "")
+                    mode = "answer"
+                    search_run_id = ans_run.get("search_run_id")
+                else:
+                    # Legacy fallback
+                    target_pid = raw_id if raw_id > 0 else None
+
+        # Fallback if query was not resolved from run ID (legacy callback or direct test mock)
+        if not query_text:
+            if callback.message and callback.message.reply_to_message and callback.message.reply_to_message.text:
+                raw = callback.message.reply_to_message.text.strip()
+                if raw.startswith("/ask"):
+                    query_text = raw[4:].strip()
+                    mode = "ask"
+                elif raw.startswith("/answer"):
+                    query_text = raw[7:].strip()
+                    mode = "answer"
+                else:
+                    query_text = raw
+                    mode = "search"
+            user_str = str(callback.from_user.id)
+            if not query_text and user_str in _last_user_query:
+                query_text, mode = _last_user_query[user_str]
+        else:
+            user_str = str(callback.from_user.id)
 
         type_map = {
             "tgt": "target",
@@ -715,13 +804,20 @@ async def cb_feedback(callback: types.CallbackQuery):
         canonical_type = type_map.get(fb_type, "found")
 
         if lib:
-            comment_json = json.dumps({"mode": mode})
+            comment_dict = {"mode": mode, "doc_scope": doc_scope}
+            if search_run_id:
+                comment_dict["search_run_id"] = search_run_id
+            if answer_run_id:
+                comment_dict["answer_run_id"] = answer_run_id
+
             lib.record_feedback(
                 query=query_text or "telegram_query",
                 feedback_type=canonical_type,
                 target_paragraph_id=target_pid,
+                search_run_id=search_run_id,
+                answer_run_id=answer_run_id,
                 user_id=user_str,
-                comment=comment_json,
+                comment=json.dumps(comment_dict),
             )
 
         if fb_type == "tgt":

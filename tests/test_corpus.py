@@ -433,6 +433,12 @@ class TestCorpusABAlignmentAndShadow(unittest.TestCase):
             self.assertEqual(st["by_mode"]["search"], 1)
             self.assertEqual(st["remaining"], 28)
 
+            # Same query but with different doc_scope -> distinct retrieval task & fingerprint!
+            gt.add_label("Чому соціальний статус впливає на здоров'я?", 101, mode="ask", doc_scope="SAPOLSKY_MEMOIR")
+            st2 = gt.get_status()
+            self.assertEqual(st2["unique_queries"], 3)
+            self.assertEqual(st2["unique_valid_queries"], 3)
+
     def test_ground_truth_validation_and_export(self):
         """Verify GroundTruthToolkit filters deleted/ambiguous noise and exports JSON cleanly."""
         with tempfile.TemporaryDirectory() as tmpdir:

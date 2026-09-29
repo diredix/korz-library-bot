@@ -1214,6 +1214,7 @@ def cmd_ground_truth_add(args) -> None:
         query=args.query,
         baseline_paragraph_id=args.target_id,
         mode=args.mode,
+        doc_scope=getattr(args, "scope", "ALL") or "ALL",
         source="cli",
         user_id=getattr(args, "user", "manual"),
         comment=getattr(args, "comment", None),
@@ -1224,6 +1225,7 @@ def cmd_ground_truth_add(args) -> None:
     print("\n✅ Ground Truth мітку успішно додано:")
     print(f"  Query:         «{item['query']}» (Fingerprint: {item['fingerprint']})")
     print(f"  Mode:          {item['mode']}")
+    print(f"  Scope:         {item['doc_scope']}")
     print(f"  Baseline PID:  #{item['baseline_paragraph_id']}")
     print(f"  Clean PID:     {clean_str} ({item['match_type']}, {sim_str})\n")
 
@@ -1423,6 +1425,7 @@ def main() -> None:
     p_gt_add.add_argument("query", help="Пошуковий запит або питання")
     p_gt_add.add_argument("target_id", type=int, help="ID правильного абзацу в baseline базі (paragraph_id)")
     p_gt_add.add_argument("--mode", default="search", choices=["search", "ask", "answer"], help="Режим пошуку")
+    p_gt_add.add_argument("--scope", default="ALL", help="Область пошуку (ALL або ID книги/документа)")
     p_gt_add.add_argument("--user", default="manual", help="Ідентифікатор користувача або джерела")
     p_gt_add.add_argument("--comment", help="Коментар або примітка")
     p_gt_add.add_argument("--baseline", default="data/korz_library.sqlite", help="Шлях до baseline бази")

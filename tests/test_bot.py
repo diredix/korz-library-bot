@@ -144,6 +144,92 @@ class TestBotHardening(unittest.TestCase):
             self.assertFalse(any("Сталася помилка під час обробки" in t for t in sent_texts))
 
 
+    def test_search_run_id_immutable_binding_in_feedback(self):
+        """
+        Verify that feedback binding to search_run_id eliminates race condition:
+        User executes Query A, then Query B, but clicks 🎯 on historical Query A.
+        Feedback MUST be recorded for Query A, not Query B.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import bot
+        from korz_core import KorzLibrary
+
+        with KorzLibrary() as library:
+            bot.lib = library
+
+            # 1. Execute Query A
+            run_id_A = library.record_search_run(
+                query="чому статус впливає на здоров'я?",
+                mode="ask",
+                doc_scope="ALL",
+                result_count=3,
+                top_paragraph_id=2500,
+                user_id="user_999",
+            )
+
+            # 2. Later, execute Query B
+            run_id_B = library.record_search_run(
+                query="чому бабуїни агресивні?",
+                mode="ask",
+                doc_scope="ALL",
+                result_count=3,
+                top_paragraph_id=3000,
+                user_id="user_999",
+            )
+
+            # Overwrite session state with Query B (or clear it completely)
+            bot._last_user_query["user_999"] = ("чому бабуїни агресивні?", "ask")
+
+            # 3. User scrolls back to Query A and clicks 🎯 on paragraph 2500
+            mock_cb = MagicMock()
+            mock_cb.data = f"fb:tgt:{run_id_A}:2500"
+            mock_cb.from_user.id = 999
+            mock_cb.message = None  # No reply_to_message needed!
+            mock_cb.answer = AsyncMock()
+
+            asyncio.run(bot.cb_feedback(mock_cb))
+            self.assertTrue(mock_cb.answer.called)
+
+            # 4. Verify feedback in DB is strictly bound to Query A and run_id_A
+            row = library.conn.execute(
+                "SELECT search_run_id, query, target_paragraph_id, feedback_type FROM search_feedback WHERE user_id = '999' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], run_id_A)
+            self.assertEqual(row[1], "чому статус впливає на здоров'я?")
+            self.assertEqual(row[2], 2500)
+            self.assertEqual(row[3], "target")
+
+            # 5. Verify /answer run binding works identically
+            ans_run_id = library.record_answer_run(
+                query="Як Фреско пояснює відмову від грошей?",
+                backend="extractive",
+                threshold=0.82,
+                source_paragraph_ids=[4258],
+                answer_text="Ресурсоорієнтована економіка усуває дефіцит.",
+                user_id="user_999",
+            )
+
+            mock_ans_cb = MagicMock()
+            mock_ans_cb.data = f"fb:ans_up:{ans_run_id}"
+            mock_ans_cb.from_user.id = 999
+            mock_ans_cb.message = None
+            mock_ans_cb.answer = AsyncMock()
+
+            asyncio.run(bot.cb_feedback(mock_ans_cb))
+
+            ans_fb_row = library.conn.execute(
+                "SELECT answer_run_id, query, feedback_type FROM search_feedback WHERE user_id = '999' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+
+            self.assertIsNotNone(ans_fb_row)
+            self.assertEqual(ans_fb_row[0], ans_run_id)
+            self.assertEqual(ans_fb_row[1], "Як Фреско пояснює відмову від грошей?")
+            self.assertEqual(ans_fb_row[2], "answer_accurate")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -868,6 +868,8 @@ def _ensure_shadow_tables(conn: sqlite3.Connection) -> None:
     CREATE TABLE IF NOT EXISTS search_feedback (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         shadow_log_id INTEGER,
+        search_run_id INTEGER,
+        answer_run_id INTEGER,
         query TEXT NOT NULL,
         target_paragraph_id INTEGER,
         target_rank INTEGER,
@@ -875,11 +877,61 @@ def _ensure_shadow_tables(conn: sqlite3.Connection) -> None:
         user_id TEXT,
         comment TEXT,
         created_at TEXT NOT NULL,
-        FOREIGN KEY (shadow_log_id) REFERENCES shadow_search_log(id) ON DELETE SET NULL
+        FOREIGN KEY (shadow_log_id) REFERENCES shadow_search_log(id) ON DELETE SET NULL,
+        FOREIGN KEY (search_run_id) REFERENCES search_runs(id) ON DELETE SET NULL,
+        FOREIGN KEY (answer_run_id) REFERENCES answer_runs(id) ON DELETE SET NULL
     );
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_query ON search_feedback(query);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_created ON search_feedback(created_at);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS search_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query TEXT NOT NULL,
+        normalized_query TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        doc_scope TEXT NOT NULL DEFAULT 'ALL',
+        corpus_version TEXT NOT NULL DEFAULT 'v1-baseline',
+        result_count INTEGER NOT NULL DEFAULT 0,
+        top_paragraph_id INTEGER,
+        latency_ms REAL NOT NULL DEFAULT 0.0,
+        user_id TEXT,
+        created_at TEXT NOT NULL
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_search_runs_query ON search_runs(normalized_query);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_search_runs_created ON search_runs(created_at);")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS answer_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        search_run_id INTEGER,
+        query TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        threshold REAL NOT NULL DEFAULT 0.82,
+        insufficient_info INTEGER NOT NULL DEFAULT 0,
+        source_paragraph_ids TEXT NOT NULL DEFAULT '[]',
+        answer_text TEXT NOT NULL DEFAULT '',
+        answer_sha256 TEXT NOT NULL DEFAULT '',
+        citation_verified INTEGER NOT NULL DEFAULT 1,
+        latency_ms REAL NOT NULL DEFAULT 0.0,
+        user_id TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (search_run_id) REFERENCES search_runs(id) ON DELETE SET NULL
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_answer_runs_created ON answer_runs(created_at);")
+
+    # Safe column migration for existing search_feedback tables
+    try:
+        cur_cols = [c[1] for c in conn.execute("PRAGMA table_info(search_feedback);").fetchall()]
+        if "search_run_id" not in cur_cols:
+            conn.execute("ALTER TABLE search_feedback ADD COLUMN search_run_id INTEGER;")
+        if "answer_run_id" not in cur_cols:
+            conn.execute("ALTER TABLE search_feedback ADD COLUMN answer_run_id INTEGER;")
+    except Exception:
+        pass
 
 
 class TextProcessor:
@@ -2900,6 +2952,8 @@ class KorzLibrary:
         query: str,
         feedback_type: str,
         shadow_log_id: Optional[int] = None,
+        search_run_id: Optional[int] = None,
+        answer_run_id: Optional[int] = None,
         target_paragraph_id: Optional[int] = None,
         target_rank: Optional[int] = None,
         user_id: Optional[str] = None,
@@ -2917,13 +2971,86 @@ class KorzLibrary:
             cur = self.conn.execute(
                 """
                 INSERT INTO search_feedback (
-                    shadow_log_id, query, target_paragraph_id, target_rank, feedback_type, user_id, comment, created_at
+                    shadow_log_id, search_run_id, answer_run_id, query, target_paragraph_id, target_rank, feedback_type, user_id, comment, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (shadow_log_id, query.strip(), target_paragraph_id, target_rank, feedback_type, user_id, comment, now_iso),
+                (shadow_log_id, search_run_id, answer_run_id, query.strip(), target_paragraph_id, target_rank, feedback_type, user_id, comment, now_iso),
             )
             return cur.lastrowid
+
+    def record_search_run(
+        self,
+        query: str,
+        mode: str = "search",
+        doc_scope: str = "ALL",
+        corpus_version: str = "v1-baseline",
+        result_count: int = 0,
+        top_paragraph_id: Optional[int] = None,
+        latency_ms: float = 0.0,
+        user_id: Optional[str] = None,
+    ) -> int:
+        """Logs an immutable search run for cross-referencing user feedback."""
+        norm_q = re.sub(r"\s+", " ", query).strip().lower()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT INTO search_runs
+                (query, normalized_query, mode, doc_scope, corpus_version, result_count, top_paragraph_id, latency_ms, user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (query.strip(), norm_q, mode, doc_scope or "ALL", corpus_version, result_count, top_paragraph_id, round(latency_ms, 2), user_id, now_iso),
+            )
+            return cur.lastrowid
+
+    def record_answer_run(
+        self,
+        query: str,
+        backend: str = "extractive",
+        threshold: float = 0.82,
+        insufficient_info: int = 0,
+        source_paragraph_ids: Optional[List[int]] = None,
+        answer_text: str = "",
+        citation_verified: int = 1,
+        latency_ms: float = 0.0,
+        search_run_id: Optional[int] = None,
+        user_id: Optional[str] = None,
+    ) -> int:
+        """Logs an immutable answer run for answer quality telemetry."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        sources_json = json.dumps(source_paragraph_ids or [])
+        ans_hash = hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT INTO answer_runs
+                (search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (search_run_id, query.strip(), backend, threshold, insufficient_info, sources_json, answer_text, ans_hash, citation_verified, round(latency_ms, 2), user_id, now_iso),
+            )
+            return cur.lastrowid
+
+    def get_search_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieves historical search run details by ID."""
+        row = self.conn.execute(
+            "SELECT id, query, normalized_query, mode, doc_scope, corpus_version, result_count, top_paragraph_id, latency_ms, user_id, created_at FROM search_runs WHERE id=?",
+            (run_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+    def get_answer_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieves historical answer run details by ID."""
+        row = self.conn.execute(
+            "SELECT id, search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at FROM answer_runs WHERE id=?",
+            (run_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
 
     def get_shadow_stats(self) -> Dict[str, Any]:
         """Summary of shadow mode telemetry."""
