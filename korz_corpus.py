@@ -1265,70 +1265,115 @@ class CorpusABShadowRunner:
             "details": results,
         }
 
-    def check_promotion_gate(self, benchmark_summary: Dict[str, Any]) -> Dict[str, Any]:
+    def check_promotion_gate(
+        self,
+        benchmark_summary: Dict[str, Any],
+        noise_challenge_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
-        Validates the 6 formal promotion gates before switching production to clean corpus:
-          1. Clean Noise@10 must be <= Baseline Noise@10 and <= 2.0%
-          2. Regressed queries <= 10.0%
-          3. Median Semantic Rank Lift >= 0
-          4. Zero meaningful token loss
-          5. Admin verify PASS on candidate database
-          6. Semantic verify PASS on candidate database
-        """
-        gates = []
+        Validates promotion gates with tiered verdict before switching production:
 
-        # Gate 1: Noise reduction
+        TECHNICAL GATES (hard requirements):
+          T1. Candidate DB integrity (SQLite & FTS5)
+          T2. Semantic index integrity (all vectors present)
+
+        RETRIEVAL GATES (require sufficient evidence):
+          R1. Clean Noise@10 must be <= Baseline Noise@10 and <= 2.0%
+          R2. Regressed queries <= threshold (adaptive: 10% for n>=30, 30% for n<30)
+          R3. Median Semantic Rank Lift >= 0
+          R4. Noise Challenge Set (optional, when provided)
+
+        Overall verdict:
+          PASS              — all gates pass, n >= 30
+          PROVISIONAL PASS  — all gates pass, n < 30
+          BLOCKED           — any gate fails
+        """
+        technical_gates = []
+        retrieval_gates = []
+
+        # ── Technical Gate T1: DB Integrity ──
+        admin_res = self.c_lib.admin_verify()
+        t1_pass = admin_res.get("all_healthy", False)
+        technical_gates.append({
+            "name": "Candidate DB Integrity",
+            "passed": t1_pass,
+            "detail": f"SQLite & FTS5 parity check {'PASS' if t1_pass else 'FAIL'}",
+        })
+
+        # ── Technical Gate T2: Semantic Index ──
+        sem_res = self.c_lib.verify_semantic_integrity()
+        t2_pass = sem_res.get("semantic_ready", False)
+        emb_present = sem_res.get("embeddings_present", 0)
+        emb_expected = sem_res.get("chunks_expected", 0)
+        technical_gates.append({
+            "name": "Semantic Index Integrity",
+            "passed": t2_pass,
+            "detail": f"Vectors: {emb_present}/{emb_expected}, READY={t2_pass}",
+        })
+
+        # ── Retrieval Gate R1: Noise Suppression ──
         c_noise = benchmark_summary.get("clean_noise_at_10_pct", 0.0)
         b_noise = benchmark_summary.get("baseline_noise_at_10_pct", 0.0)
-        g1_pass = c_noise <= b_noise and c_noise <= 2.0
-        gates.append({
+        r1_pass = c_noise <= b_noise and c_noise <= 2.0
+        retrieval_gates.append({
             "name": "Noise@10 Suppression",
-            "passed": g1_pass,
+            "passed": r1_pass,
             "detail": f"Clean ({c_noise}%) <= Baseline ({b_noise}%) and <= 2.0%",
         })
 
-        # Gate 2: Regression limit (adaptive: stricter with more queries)
+        # ── Retrieval Gate R2: Regression Limit (adaptive) ──
         reg = benchmark_summary.get("regressed_pct", 0.0)
         n_judged = benchmark_summary.get("judged_queries", 0)
         reg_threshold = 10.0 if n_judged >= 30 else 30.0
-        g2_pass = reg <= reg_threshold
-        gates.append({
+        r2_pass = reg <= reg_threshold
+        retrieval_gates.append({
             "name": "Rank Regression Margin",
-            "passed": g2_pass,
+            "passed": r2_pass,
             "detail": f"Regressed queries ({reg}%) <= {reg_threshold}% (n={n_judged})",
         })
 
-        # Gate 3: Rank Lift non-negative
+        # ── Retrieval Gate R3: Rank Lift ──
         lift = benchmark_summary.get("median_semantic_rank_lift", 0)
-        g3_pass = lift >= 0
-        gates.append({
+        r3_pass = lift >= 0
+        retrieval_gates.append({
             "name": "Semantic Rank Lift",
-            "passed": g3_pass,
+            "passed": r3_pass,
             "detail": f"Median semantic rank lift ({lift:+.0f}) >= 0",
         })
 
-        # Gate 4: Admin verify
-        admin_res = self.c_lib.admin_verify()
-        g4_pass = admin_res.get("all_healthy", False)
-        gates.append({
-            "name": "Candidate DB Integrity",
-            "passed": g4_pass,
-            "detail": f"SQLite & FTS5 parity check {'PASS' if g4_pass else 'FAIL'}",
-        })
+        # ── Retrieval Gate R4: Noise Challenge Set (optional) ──
+        if noise_challenge_summary:
+            nc_b = noise_challenge_summary.get("baseline_noise_at_10_pct", 0.0)
+            nc_c = noise_challenge_summary.get("clean_noise_at_10_pct", 0.0)
+            nc_queries = noise_challenge_summary.get("queries_count", 0)
+            r4_pass = nc_c < nc_b
+            retrieval_gates.append({
+                "name": "Noise Challenge Suppression",
+                "passed": r4_pass,
+                "detail": f"Challenge Noise@10: Clean ({nc_c}%) < Baseline ({nc_b}%) across {nc_queries} queries",
+            })
 
-        # Gate 5: Semantic verify
-        sem_res = self.c_lib.verify_semantic_integrity()
-        g5_pass = sem_res.get("semantic_ready", False)
-        gates.append({
-            "name": "Semantic Index Integrity",
-            "passed": g5_pass,
-            "detail": f"Vectors present: {sem_res.get('embeddings_present', 0)}/{sem_res.get('total_chunks', 0)}, READY={g5_pass}",
-        })
+        # ── Combine into tiered verdict ──
+        all_technical = all(g["passed"] for g in technical_gates)
+        all_retrieval = all(g["passed"] for g in retrieval_gates)
+        sufficient_evidence = n_judged >= 30
 
-        all_passed = all(g["passed"] for g in gates)
+        if all_technical and all_retrieval and sufficient_evidence:
+            status = "PASS"
+        elif all_technical and all_retrieval and not sufficient_evidence:
+            status = "PROVISIONAL PASS"
+        else:
+            status = "BLOCKED"
+
         return {
-            "status": "PASS" if all_passed else "BLOCKED",
-            "all_gates_passed": all_passed,
-            "gates": gates,
+            "status": status,
+            "all_gates_passed": all_technical and all_retrieval,
+            "sufficient_evidence": sufficient_evidence,
+            "judged_queries": n_judged,
+            "min_queries_for_promotion": 30,
+            "technical_gates": technical_gates,
+            "retrieval_gates": retrieval_gates,
+            # Legacy compat
+            "gates": technical_gates + retrieval_gates,
         }
 

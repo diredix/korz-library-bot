@@ -300,7 +300,7 @@ class TestCorpusABAlignmentAndShadow(unittest.TestCase):
             self.assertEqual(res["content_overlap_at_5_pct"], 100.0)
 
     def test_promotion_gate_verdict(self):
-        """Verify Promotion Gate checks all operational & relevance criteria."""
+        """Verify Promotion Gate tiered verdict: Technical + Retrieval + Evidence."""
         class MockCandLib:
             def __init__(self, admin_ok=True, sem_ok=True):
                 self._admin_ok = admin_ok
@@ -310,11 +310,11 @@ class TestCorpusABAlignmentAndShadow(unittest.TestCase):
                 return {"all_healthy": self._admin_ok}
 
             def verify_semantic_integrity(self, model_id=None):
-                return {"semantic_ready": self._sem_ok, "embeddings_present": 100, "total_chunks": 100}
+                return {"semantic_ready": self._sem_ok, "embeddings_present": 100, "chunks_expected": 100}
 
         runner = CorpusABShadowRunner(baseline_lib=None, candidate_lib=MockCandLib(True, True))
 
-        # PASS case (n>=30 triggers strict 10% regression threshold)
+        # FULL PASS case (n>=30 → strict 10% threshold, sufficient evidence)
         good_summary = {
             "clean_noise_at_10_pct": 0.0,
             "baseline_noise_at_10_pct": 5.0,
@@ -324,24 +324,49 @@ class TestCorpusABAlignmentAndShadow(unittest.TestCase):
         }
         verdict = runner.check_promotion_gate(good_summary)
         self.assertTrue(verdict["all_gates_passed"])
+        self.assertTrue(verdict["sufficient_evidence"])
         self.assertEqual(verdict["status"], "PASS")
+        # Check tiered structure exists
+        self.assertIn("technical_gates", verdict)
+        self.assertIn("retrieval_gates", verdict)
+
+        # PROVISIONAL PASS case (n<30 → all gates pass but insufficient evidence)
+        provisional_summary = dict(good_summary, judged_queries=8)
+        prov_verdict = runner.check_promotion_gate(provisional_summary)
+        self.assertTrue(prov_verdict["all_gates_passed"])
+        self.assertFalse(prov_verdict["sufficient_evidence"])
+        self.assertEqual(prov_verdict["status"], "PROVISIONAL PASS")
 
         # FAIL cases:
-        # 1. High clean noise
+        # 1. High clean noise → BLOCKED
         bad_noise = dict(good_summary, clean_noise_at_10_pct=3.5)
         self.assertFalse(runner.check_promotion_gate(bad_noise)["all_gates_passed"])
+        self.assertEqual(runner.check_promotion_gate(bad_noise)["status"], "BLOCKED")
 
-        # 2. Too many regressions (>10% with n>=30)
+        # 2. Too many regressions (>10% with n>=30) → BLOCKED
         bad_reg = dict(good_summary, regressed_pct=15.0)
         self.assertFalse(runner.check_promotion_gate(bad_reg)["all_gates_passed"])
 
-        # 3. Negative rank lift
+        # 3. Negative rank lift → BLOCKED
         bad_lift = dict(good_summary, median_semantic_rank_lift=-1)
         self.assertFalse(runner.check_promotion_gate(bad_lift)["all_gates_passed"])
 
-        # 4. Corrupted candidate DB
+        # 4. Corrupted candidate DB → BLOCKED (technical gate fails)
         corrupt_runner = CorpusABShadowRunner(baseline_lib=None, candidate_lib=MockCandLib(admin_ok=False))
         self.assertFalse(corrupt_runner.check_promotion_gate(good_summary)["all_gates_passed"])
+
+        # 5. Noise challenge: Clean must be strictly less than Baseline
+        nc_good = {"baseline_noise_at_10_pct": 10.0, "clean_noise_at_10_pct": 2.0, "queries_count": 12}
+        verdict_nc = runner.check_promotion_gate(good_summary, noise_challenge_summary=nc_good)
+        self.assertTrue(verdict_nc["all_gates_passed"])
+
+        nc_bad = {"baseline_noise_at_10_pct": 5.0, "clean_noise_at_10_pct": 5.0, "queries_count": 12}
+        verdict_nc_bad = runner.check_promotion_gate(good_summary, noise_challenge_summary=nc_bad)
+        self.assertFalse(verdict_nc_bad["all_gates_passed"])
+
+        # 6. Semantic integrity reports correct denominator key
+        sem_gate = [g for g in verdict["technical_gates"] if g["name"] == "Semantic Index Integrity"][0]
+        self.assertIn("100/100", sem_gate["detail"])
 
 
 if __name__ == "__main__":

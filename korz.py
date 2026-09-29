@@ -1034,7 +1034,9 @@ def cmd_corpus_promotion_gate(args) -> None:
     pmap = CorpusParagraphMap(candidate_path)
     runner = CorpusABShadowRunner(b_lib, c_lib, pmap)
 
-    benchmarks = [
+    # ── REGRESSION SET ──
+    # target = baseline known-good result (checks nothing important broke)
+    regression_benchmarks = [
         {"query": "стрес і соціальна ієрархія", "target_id": 7033},
         {"query": "бабуїни павіани агресія кортизол", "target_id": 12345},
         {"query": "семантичні реакції та ототожнення карти з територією", "target_id": 5227},
@@ -1045,26 +1047,79 @@ def cmd_corpus_promotion_gate(args) -> None:
         {"query": "мова наука та розсудливість не-арістотелівські системи", "target_id": 5067},
     ]
 
-    summary = runner.run_benchmark(benchmarks, top_k=10)
-    verdict = runner.check_promotion_gate(summary)
+    # ── NOISE CHALLENGE SET ──
+    # Queries designed to provoke noise results (chapter names, author names,
+    # page numbers, short ambiguous terms, header-like phrases)
+    noise_challenge_queries = [
+        {"query": "Сапольський", "target_id": None},
+        {"query": "Спогади примата", "target_id": None},
+        {"query": "Жак Фреско", "target_id": None},
+        {"query": "Проєктування майбутнього", "target_id": None},
+        {"query": "Коржибський", "target_id": None},
+        {"query": "Наука і розсудливість", "target_id": None},
+        {"query": "Розділ 1", "target_id": None},
+        {"query": "Передмова", "target_id": None},
+        {"query": "Вступ", "target_id": None},
+        {"query": "Бібліографія", "target_id": None},
+        {"query": "примітки", "target_id": None},
+        {"query": "зміст", "target_id": None},
+    ]
 
     print("\n" + "=" * 65)
-    print("🛡️  KORZ Corpus v2 Clean Promotion Gate Verdict")
+    print("🛡️  KORZ Corpus v2 Clean Promotion Gate")
     print("=" * 65)
-    print(f"Статус допуску до Production: [{verdict['status']}]")
+
+    print("\n📋 Regression Benchmark (n={})...".format(len(regression_benchmarks)))
+    summary = runner.run_benchmark(regression_benchmarks, top_k=10)
+
+    print("📋 Noise Challenge Set (n={})...".format(len(noise_challenge_queries)))
+    noise_summary = runner.run_benchmark(noise_challenge_queries, top_k=10)
+
+    verdict = runner.check_promotion_gate(summary, noise_challenge_summary=noise_summary)
+
+    # ── Display Tiered Verdict ──
+    print("\n" + "─" * 65)
+    print("⚙️  TECHNICAL GATES")
     print("─" * 65)
-    for g in verdict["gates"]:
+    for g in verdict["technical_gates"]:
         icon = "✅" if g["passed"] else "❌"
-        print(f"  {icon} {g['name']:<27} : {g['detail']}")
+        print(f"  {icon} {g['name']:<30} : {g['detail']}")
+
+    print("\n" + "─" * 65)
+    print("🔍 RETRIEVAL GATES")
     print("─" * 65)
-    if verdict["all_gates_passed"]:
-        print("🎉 Всі обов'язкові критерії успішно пройдено!")
-        print("   Очищений корпус рекомендовано для переходу на 'Corpus v2-clean1'.\n")
+    for g in verdict["retrieval_gates"]:
+        icon = "✅" if g["passed"] else "❌"
+        print(f"  {icon} {g['name']:<30} : {g['detail']}")
+
+    print("\n" + "─" * 65)
+    print("📊 EVIDENCE STATUS")
+    print("─" * 65)
+    n = verdict["judged_queries"]
+    n_min = verdict["min_queries_for_promotion"]
+    ev_icon = "✅" if verdict["sufficient_evidence"] else "🟡"
+    print(f"  {ev_icon} {'Judged queries':<30} : {n} / {n_min} minimum")
+    if not verdict["sufficient_evidence"]:
+        print(f"     ℹ️  {n_min - n} додаткових ground-truth запитів потрібно для повного PASS")
+
+    print("\n" + "=" * 65)
+    status = verdict["status"]
+    if status == "PASS":
+        print(f"🎉 Статус: [{status}]")
+        print("   Очищений корпус рекомендовано для переходу на 'Corpus v2-clean1'.")
+    elif status == "PROVISIONAL PASS":
+        print(f"🟡 Статус: [{status}]")
+        print("   Технічні критерії пройдені. Retrieval-критерії пройдені попередньо.")
+        print("   ⏸  HOLD — недостатньо ground-truth для production promotion.")
+        print(f"   Потрібно: {n_min}+ 🎯 запитів з людською розміткою.")
     else:
-        print("⚠️  Є непройдені критерії. Перехід наразі заблоковано.\n")
+        print(f"❌ Статус: [{status}]")
+        print("   Є непройдені критерії. Перехід заблоковано.")
+    print("=" * 65 + "\n")
 
     b_lib.close()
     c_lib.close()
+
 
 
 def main() -> None:
