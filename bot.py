@@ -616,6 +616,8 @@ async def _execute_answer_workflow(message: types.Message, question: str):
                 input_bundle_json=getattr(res, "input_bundle_json", ""),
                 retrieval_mode=getattr(res, "retrieval_mode", "dense"),
                 shadow_rrf_json=getattr(res, "shadow_rrf_json", ""),
+                entity_intent=getattr(res, "entity_intent", ""),
+                entity_telemetry_json=getattr(res, "entity_telemetry_json", ""),
             )
 
         if res.insufficient_info:

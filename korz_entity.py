@@ -50,10 +50,19 @@ def ensure_entity_schema(conn: sqlite3.Connection) -> None:
         entity_id INTEGER NOT NULL,
         alias TEXT NOT NULL,
         language TEXT NOT NULL DEFAULT 'uk',
+        alias_type TEXT NOT NULL DEFAULT 'manual',
         FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
         UNIQUE(entity_id, alias)
     );
     """)
+
+    # Safe column migration for entity_aliases
+    try:
+        cur_cols = [c[1] for c in conn.execute("PRAGMA table_info(entity_aliases);").fetchall()]
+        if "alias_type" not in cur_cols:
+            conn.execute("ALTER TABLE entity_aliases ADD COLUMN alias_type TEXT DEFAULT 'manual';")
+    except Exception:
+        pass
 
     conn.execute("""
     CREATE TABLE IF NOT EXISTS entity_scenes (
@@ -131,16 +140,33 @@ def register_alias(
     entity_id: int,
     alias: str,
     language: str = "uk",
+    alias_type: str = "manual",
 ) -> None:
-    """Register an alias for an entity."""
+    """Register an alias for an entity with provenance tracking (manual vs generated_morphology)."""
     conn.execute(
         """
-        INSERT OR IGNORE INTO entity_aliases (entity_id, alias, language)
-        VALUES (?, ?, ?);
+        INSERT OR IGNORE INTO entity_aliases (entity_id, alias, language, alias_type)
+        VALUES (?, ?, ?, ?);
         """,
-        (entity_id, alias.strip(), language),
+        (entity_id, alias.strip(), language, alias_type),
     )
     conn.commit()
+
+
+def generate_ukrainian_name_variants(name: str) -> List[str]:
+    """
+    Generate deterministic grammatical case variants for Ukrainian masculine/feminine names.
+    Provides rigorous nominal declension without heuristic prefix/substring matching.
+    Strictly generates standard 2nd declension masculine hard-consonant case endings:
+      -а (gen/acc), -у (dat/loc), -ом (inst), -і (loc), -е (voc), -ові (dat)
+    """
+    variants = []
+    clean_name = name.strip()
+    # Hard consonant endings: Соломон, Нік, Рубен, Аарон
+    if re.search(r"[бвгґджзклмнпрстфхцчшщ]$", clean_name, re.IGNORECASE):
+        for end in ["а", "у", "ом", "і", "е", "ові"]:
+            variants.append(clean_name + end)
+    return variants
 
 
 def register_scene(
@@ -200,9 +226,10 @@ def resolve_entity(conn: sqlite3.Connection, text: str) -> Optional[Dict[str, An
     """
     Resolve an entity from user query text using word-boundary matching.
     Prevents false substrings (e.g. 'Ніколи' != 'Нік', 'Ніксон' != 'Нік').
+    Tracks provenance via alias_type ('manual' vs 'generated_morphology').
     """
     cur = conn.execute("""
-        SELECT e.id, e.canonical_name, e.entity_type, e.book_id, a.alias
+        SELECT e.id, e.canonical_name, e.entity_type, e.book_id, a.alias, COALESCE(a.alias_type, 'manual')
         FROM entities e
         JOIN entity_aliases a ON a.entity_id = e.id
         ORDER BY LENGTH(a.alias) DESC
@@ -210,7 +237,7 @@ def resolve_entity(conn: sqlite3.Connection, text: str) -> Optional[Dict[str, An
     rows = cur.fetchall()
 
     normalized_text = f" {text.lower()} "
-    for eid, cname, etype, bid, alias in rows:
+    for eid, cname, etype, bid, alias, atype in rows:
         alias_clean = alias.strip().lower()
         # Word boundary pattern for Cyrillic and Latin
         pattern = rf"(?:^|[^\wа-яА-ЯіїєґІЇЄҐ]){re.escape(alias_clean)}(?:$|[^\wа-яА-ЯіїєґІЇЄҐ])"
@@ -221,6 +248,7 @@ def resolve_entity(conn: sqlite3.Connection, text: str) -> Optional[Dict[str, An
                 "entity_type": etype,
                 "book_id": bid,
                 "matched_alias": alias,
+                "alias_type": atype,
             }
     return None
 
@@ -501,6 +529,16 @@ def _fetch_paragraphs_by_pids(conn: sqlite3.Connection, pids: List[int]) -> List
     ORDER BY p.id
     """
     rows = conn.execute(sql, pids).fetchall()
+    scene_map = {}
+    try:
+        sc_rows = conn.execute(
+            f"SELECT paragraph_id, scene_id FROM entity_mentions WHERE paragraph_id IN ({placeholders}) AND scene_id IS NOT NULL", pids
+        ).fetchall()
+        for pid_val, sc_id in sc_rows:
+            scene_map[pid_val] = sc_id
+    except Exception:
+        pass
+
     bundle_items: List[Dict[str, Any]] = []
     for idx, r in enumerate(rows, 1):
         clean_text = (r[4] or "").strip()
@@ -515,6 +553,7 @@ def _fetch_paragraphs_by_pids(conn: sqlite3.Connection, pids: List[int]) -> List
             "author": r[6],
             "text_sha256": compute_text_sha256(clean_text),
             "score": 1.0,
+            "scene_id": scene_map.get(r[0], ""),
         })
     return bundle_items
 
@@ -771,7 +810,7 @@ def build_entity_evidence_bundle(
     """
     co_mentions = find_co_mentioned_terms(conn, query, entity_id)
     co_entity = resolve_co_entity(conn, query, entity_id) if co_mentions else None
-    has_co_entity = co_entity is not None
+    has_co_entity = (co_entity is not None) or bool(co_mentions)
 
     entity_intent = detect_entity_intent(query, has_co_entity=has_co_entity)
     logger.info(f"Entity intent for '{query[:50]}': {entity_intent} (co_entity={co_entity})")
@@ -817,6 +856,8 @@ def seed_pilot_nick(conn: sqlite3.Connection) -> int:
             "той негідник",
         ],
     )
+    for v in generate_ukrainian_name_variants("Нік"):
+        register_alias(conn, entity_id, v, language="uk", alias_type="generated_morphology")
 
     # Register Scene Clusters
     scenes = [
@@ -996,6 +1037,8 @@ def seed_pilot_solomon(conn: sqlite3.Connection) -> int:
         book_id=book_id,
         aliases=["Соломон", "Solomon", "вожак Соломон", "альфа Соломон"],
     )
+    for v in generate_ukrainian_name_variants("Соломон"):
+        register_alias(conn, entity_id, v, language="uk", alias_type="generated_morphology")
 
     # Deterministic Mention Extraction
     rows = conn.execute("SELECT id, display_text FROM paragraphs WHERE document_id = ? ORDER BY id", (book_id,)).fetchall()

@@ -83,8 +83,8 @@ class TestAnswerEngine(unittest.TestCase):
 
         self.assertGreaterEqual(mock_msg.answer.call_count, 1)
         sent_texts = [call[0][0] for call in mock_msg.answer.call_args_list]
-        self.assertTrue(any("Відповідь за бібліотекою KORZ" in t for t in sent_texts))
-        self.assertTrue(any("Використані джерела" in t for t in sent_texts))
+        self.assertTrue(any("Відповідь за бібліотекою KORZ" in t for t in sent_texts), f"Sent texts: {sent_texts}")
+        self.assertTrue(any("Використані джерела" in t for t in sent_texts), f"Sent texts: {sent_texts}")
 
     def test_bot_cmd_answer_disabled_notice(self):
         """Verify bot.cmd_answer returns polite notice when KORZ_ANSWER_ENABLED=0."""

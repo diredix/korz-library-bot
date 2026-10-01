@@ -114,6 +114,8 @@ class AnswerResult:
     mode: str = "extractive"  # 'extractive' | 'gemini' | 'generative'
     retrieval_mode: str = "dense"  # 'dense' | 'rrf' | 'hybrid'
     shadow_rrf_json: str = ""
+    entity_intent: str = ""
+    entity_telemetry_json: str = ""
     model_tier: str = "low"   # 'low' | 'medium' | 'high'
     model_id: str = ""        # e.g. 'gemini-3.8-flash-low'
     adaptive_trigger: str = "default"  # 'default' | 'explicit_deep' | 'adaptive_comparison' | 'adaptive_multi_author' | 'adaptive_multi_book'
@@ -229,6 +231,8 @@ class AnswerEngine:
         # Phase 4: Entity Dossier & Character Profiling Routing
         entity_info = None
         intent = "general"
+        entity_intent = ""
+        entity_telemetry = {}
         try:
             import korz_entity
             entity_info = korz_entity.resolve_entity(self.lib.conn, clean_q)
@@ -238,6 +242,20 @@ class AnswerEngine:
 
         if entity_info and intent == "character_profiling":
             import korz_entity
+            co_mentions = korz_entity.find_co_mentioned_terms(self.lib.conn, clean_q, entity_info["id"])
+            co_entity = korz_entity.resolve_co_entity(self.lib.conn, clean_q, entity_info["id"]) if co_mentions else None
+            has_co = (co_entity is not None) or bool(co_mentions)
+            entity_intent = korz_entity.detect_entity_intent(clean_q, has_co_entity=has_co)
+
+            builder_map = {
+                "profile": "build_profile_bundle",
+                "evolution": "build_evolution_bundle",
+                "relationship": "build_relationship_bundle",
+                "affiliation": "build_affiliation_bundle",
+                "timeline": "build_timeline_bundle",
+            }
+            builder_name = builder_map.get(entity_intent, "build_profile_bundle")
+
             entity_bundle = korz_entity.build_entity_evidence_bundle(
                 self.lib.conn,
                 entity_id=entity_info["id"],
@@ -262,6 +280,26 @@ class AnswerEngine:
                 ]
                 retrieval_mode = "entity_dossier"
                 top_score = 1.0
+
+                co_names = [co_entity["canonical_name"]] if co_entity else co_mentions
+                pids = [b["paragraph_id"] for b in entity_bundle]
+                scenes_in_bundle = list(dict.fromkeys(b.get("scene_id") for b in entity_bundle if b.get("scene_id")))
+                alias_type = entity_info.get("alias_type", "manual")
+                entity_telemetry = {
+                    "entity_intent": entity_intent,
+                    "primary_entity": entity_info["canonical_name"],
+                    "co_entities": co_names,
+                    "bundle_builder": builder_name,
+                    "scene_count": len(scenes_in_bundle),
+                    "scene_ids": scenes_in_bundle,
+                    "pid_count": len(pids),
+                    "pids": pids,
+                    "entity_resolution": {
+                        "confidence": 1.0 if alias_type == "manual" else 0.98,
+                        "matched_alias": entity_info.get("matched_alias", ""),
+                        "alias_type": alias_type,
+                    },
+                }
 
         if sources and retrieval_mode == "entity_dossier":
             pass  # Already resolved via deterministic Entity Dossier
@@ -426,6 +464,8 @@ class AnswerEngine:
         res.confidence_score = top_score
         res.retrieval_mode = retrieval_mode
         res.shadow_rrf_json = shadow_rrf_json
+        res.entity_intent = entity_intent
+        res.entity_telemetry_json = json.dumps(entity_telemetry, ensure_ascii=False) if entity_telemetry else ""
         res.book_count = len({s.document_id for s in sources if s.document_id})
         res.author_count = len({s.author for s in sources if s.author})
         res.prompt_version = PROMPT_VERSION

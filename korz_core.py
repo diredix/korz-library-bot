@@ -989,6 +989,10 @@ def _ensure_shadow_tables(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE answer_runs ADD COLUMN retrieval_mode TEXT DEFAULT 'dense';")
         if "shadow_rrf_json" not in ans_cols:
             conn.execute("ALTER TABLE answer_runs ADD COLUMN shadow_rrf_json TEXT DEFAULT '';")
+        if "entity_intent" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN entity_intent TEXT DEFAULT '';")
+        if "entity_telemetry_json" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN entity_telemetry_json TEXT DEFAULT '';")
     except Exception:
         pass
 
@@ -3089,6 +3093,8 @@ class KorzLibrary:
         input_bundle_json: str = "",
         retrieval_mode: str = "dense",
         shadow_rrf_json: str = "",
+        entity_intent: str = "",
+        entity_telemetry_json: str = "",
     ) -> int:
         """Logs an immutable answer run for answer quality telemetry."""
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -3099,10 +3105,10 @@ class KorzLibrary:
             cur = self.conn.execute(
                 """
                 INSERT INTO answer_runs
-                (search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, source_text_hashes, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, source_text_hashes, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json, entity_intent, entity_telemetry_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (search_run_id, query.strip(), backend, threshold, insufficient_info, sources_json, answer_text, ans_hash, citation_verified, round(latency_ms, 2), user_id, now_iso, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, hashes_json, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json),
+                (search_run_id, query.strip(), backend, threshold, insufficient_info, sources_json, answer_text, ans_hash, citation_verified, round(latency_ms, 2), user_id, now_iso, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, hashes_json, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json, entity_intent, entity_telemetry_json),
             )
             return cur.lastrowid
 
@@ -3119,7 +3125,7 @@ class KorzLibrary:
     def get_answer_run(self, run_id: int) -> Optional[Dict[str, Any]]:
         """Retrieves historical answer run details by ID."""
         row = self.conn.execute(
-            "SELECT id, search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, source_text_hashes, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json FROM answer_runs WHERE id=?",
+            "SELECT id, search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, source_text_hashes, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json, entity_intent, entity_telemetry_json FROM answer_runs WHERE id=?",
             (run_id,)
         ).fetchone()
         if not row:
