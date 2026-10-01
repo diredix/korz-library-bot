@@ -227,11 +227,10 @@ def resolve_entity(conn: sqlite3.Connection, text: str) -> Optional[Dict[str, An
 
 def detect_character_intent(query: str) -> str:
     """
-    Classify user query intent into cognitive categories:
-      - 'character_profiling': 'Яким був...', 'Якою була...', 'Ким був...', 'Хто такий...', 'характер', 'поведінка', 'ідеї'
-      - 'pinpoint_fact': factual point query
+    Classify user query intent into cognitive categories (top-level routing):
+      - 'character_profiling': any entity-centric query (profile, evolution, relationship, etc.)
       - 'causal_narrative': 'чому', 'як сталося'
-      - 'general': standard retrieval
+      - 'pinpoint_fact': factual point query
     """
     q_lower = query.lower()
     profile_patterns = [
@@ -255,6 +254,31 @@ def detect_character_intent(query: str) -> str:
         r"\bщо\s+думав\b",
         r"\bякі\s+ідеї\b",
         r"\bпогляди\b",
+        # Evolution / timeline triggers
+        r"\bяк\s+змінився\b",
+        r"\bяк\s+змінилася\b",
+        r"\bяк\s+змінювал\b",
+        r"\bяк\s+склалася\s+доля\b",
+        r"\bщо\s+сталося\s+з\b",
+        r"\bнаприкінці\b",
+        r"\bз\s+роками\b",
+        r"\bз\s+часом\b",
+        r"\bпротягом\b",
+        r"\bхронолог\b",
+        # Relationship triggers
+        r"\bміж\b.*\bі\b",
+        r"\bконфлікт\b",
+        r"\bпротистояння\b",
+        r"\bворог\b",
+        r"\bінцидент\b",
+        r"\bсутичк\b",
+        # Affiliation triggers
+        r"\bстосунк\b",
+        r"\bродин\b",
+        r"\bхто\s+належав\b",
+        r"\bхто\s+входив\b",
+        r"\bколо\b",
+        r"\bдіти\b",
     ]
     for p in profile_patterns:
         if re.search(p, q_lower):
@@ -264,6 +288,73 @@ def detect_character_intent(query: str) -> str:
         return "causal_narrative"
 
     return "pinpoint_fact"
+
+
+def detect_entity_intent(query: str, has_co_entity: bool = False) -> str:
+    """
+    Fine-grained Entity Intent Classification (Phase 4.2).
+
+    Five entity-centric query modes:
+      - 'profile':       Static portrait — personality, behavior, defining traits
+      - 'evolution':     Dynamic trajectory — how the entity changed over time
+      - 'relationship':  Cross-entity dynamics — conflict, alliance, interaction between two entities
+      - 'affiliation':   Social/group membership — family, troop, hierarchy, clan
+      - 'timeline':      Chronological arc — full life story from first to last appearance
+
+    Args:
+        query: user query text
+        has_co_entity: True if a second entity was detected in the query
+    """
+    q_lower = query.lower()
+
+    # ── 1. Relationship: two entities interacting ──
+    # Must check first because it depends on co-entity detection
+    if has_co_entity:
+        rel_patterns = [
+            r"\bміж\b", r"\bконфлікт", r"\bпротистоянн", r"\bворог",
+            r"\bінцидент", r"\bсутичк", r"\bбійк", r"\bпоєдин",
+            r"\bстосунк", r"\bсоюз", r"\bпроти\b", r"\bнапад",
+            r"\bображ", r"\bатак", r"\bі\b",
+        ]
+        if any(re.search(p, q_lower) for p in rel_patterns):
+            return "relationship"
+
+    # ── 2. Evolution: dynamic trajectory over time ──
+    evo_patterns = [
+        r"\bяк\s+змінивс", r"\bяк\s+змінилас", r"\bяк\s+змінювал",
+        r"\bяк\s+склалас.+\bдол", r"\bщо\s+сталос",
+        r"\bнаприкінці\b", r"\bпід\s+кінець\b",
+        r"\bпішов\s+з\s+життя", r"\bпішла\s+з\s+життя",
+        r"\bпомер", r"\bзагинув", r"\bзагинул",
+        r"\bвтратив\s+влад", r"\bвтратила",
+        r"\bз\s+роками\b", r"\bз\s+часом\b",
+    ]
+    if any(re.search(p, q_lower) for p in evo_patterns):
+        return "evolution"
+
+    # ── 3. Timeline: chronological sweep ──
+    timeline_patterns = [
+        r"\bпротягом\b", r"\bхронолог", r"\bвід\s+початку\b",
+        r"\bвід\s+першої\b", r"\bдо\s+останньої\b",
+        r"\bісторія\s+життя", r"\bжиттєвий\s+шлях",
+        r"\bвсе\s+про\b", r"\bповна\s+історія",
+    ]
+    if any(re.search(p, q_lower) for p in timeline_patterns):
+        return "timeline"
+
+    # ── 4. Affiliation: social/group membership ──
+    affil_patterns = [
+        r"\bродин", r"\bхто\s+належав", r"\bхто\s+входив",
+        r"\bколо\b", r"\bдіти\b", r"\bсім'", r"\bклан",
+        r"\bдинаст", r"\bматріарх", r"\bпатріарх",
+        r"\bматеринськ", r"\bбатьківськ",
+        r"\bстосунк",
+    ]
+    if any(re.search(p, q_lower) for p in affil_patterns):
+        return "affiliation"
+
+    # ── 5. Profile: default for entity-centric queries ──
+    return "profile"
 
 
 def get_entity_dossier(conn: sqlite3.Connection, entity_id: int) -> Dict[str, Any]:
@@ -339,11 +430,8 @@ def get_entity_dossier(conn: sqlite3.Connection, entity_id: int) -> Dict[str, An
 
 def detect_query_aspect(query: str) -> str:
     """
-    Detect the specific biographical aspect requested:
-      - 'trajectory': 'як змінився', 'як склалася доля', 'що сталося', 'наприкінці', 'з роками'
-      - 'conflict': 'конфлікт', 'бійка', 'протистояння', 'ворог', 'інцидент', 'поєдинок'
-      - 'relational': 'стосунки', 'родина', 'союзник', 'партнер', 'хто належав', 'діти'
-      - 'personality': 'яким був', 'характер', 'особистість', 'поведінка', 'портрет'
+    DEPRECATED in Phase 4.2 — use detect_entity_intent() instead.
+    Kept for backward compatibility with existing test suite.
     """
     q_lower = query.lower()
     if any(k in q_lower for k in ["як змінився", "як змінилося", "як змінювалася", "що сталося", "наприкінці", "доля", "з роками", "з часом"]):
@@ -376,82 +464,34 @@ def find_co_mentioned_terms(conn: sqlite3.Connection, query: str, exclude_entity
     return list(set(matched))
 
 
-def build_entity_evidence_bundle(
-    conn: sqlite3.Connection,
-    entity_id: int,
-    query: str,
-    max_paragraphs: int = 12,
-) -> List[Dict[str, Any]]:
-    """
-    Assemble the primary text Evidence Bundle for Gemini generation.
-    Strictly queries authentic corpus paragraphs by PID ranges defined in Entity Scenes.
-    Applies Query-Specific Aspect Filtering and Cross-Entity Co-occurrence boosts.
-    """
-    intent = detect_character_intent(query)
-    dossier = get_entity_dossier(conn, entity_id)
-    if not dossier or not dossier.get("scenes"):
+def resolve_co_entity(conn: sqlite3.Connection, query: str, primary_entity_id: int) -> Optional[Dict[str, Any]]:
+    """Resolve a second entity from the query (excluding the primary one)."""
+    cur = conn.execute("""
+        SELECT e.id, e.canonical_name, e.entity_type, e.book_id, a.alias
+        FROM entities e
+        JOIN entity_aliases a ON a.entity_id = e.id
+        WHERE e.id != ?
+        ORDER BY LENGTH(a.alias) DESC
+    """, (primary_entity_id,))
+    rows = cur.fetchall()
+    normalized_text = f" {query.lower()} "
+    for eid, cname, etype, bid, alias in rows:
+        alias_clean = alias.strip().lower()
+        pattern = rf"(?:^|[^\wа-яА-ЯіїєґІЇЄҐ]){re.escape(alias_clean)}(?:$|[^\wа-яА-ЯіїєґІЇЄҐ])"
+        if re.search(pattern, normalized_text, re.IGNORECASE):
+            return {"id": eid, "canonical_name": cname, "entity_type": etype, "book_id": bid}
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Phase 4.2: Specialized Evidence Bundle Builders
+# ═══════════════════════════════════════════════════════════════════
+
+def _fetch_paragraphs_by_pids(conn: sqlite3.Connection, pids: List[int]) -> List[Dict[str, Any]]:
+    """Fetch authentic paragraph texts from corpus by PID list. Shared helper."""
+    if not pids:
         return []
-
-    scenes = dossier["scenes"]
-    aspect = detect_query_aspect(query)
-    co_mentions = find_co_mentioned_terms(conn, query, entity_id)
-
-    scored_scenes: List[Tuple[float, Dict[str, Any]]] = []
-    for sc in scenes:
-        score = 0.0
-
-        # 1. Co-occurrence boost: if scene paragraphs mention co-mentioned terms
-        if co_mentions:
-            scene_text_row = conn.execute(
-                "SELECT GROUP_CONCAT(display_text, ' ') FROM paragraphs WHERE id BETWEEN ? AND ?",
-                (sc["start_pid"], sc["end_pid"]),
-            ).fetchone()
-            scene_text = (scene_text_row[0] or "").lower()
-            for term in co_mentions:
-                if term.lower() in scene_text:
-                    score += 50.0
-
-        # 2. Aspect match boost
-        stype = sc["scene_type"]
-        if aspect == "conflict":
-            if stype in ("confrontation", "dominance_event", "dominance_bluff_resolution"):
-                score += 25.0
-        elif aspect == "trajectory":
-            if stype in ("historical_demise", "alpha_reign"):
-                score += 20.0
-            elif stype == "personality_profile":
-                score += 10.0
-        elif aspect == "relational":
-            if stype in ("social_interaction", "alpha_reign"):
-                score += 20.0
-        elif aspect == "personality":
-            if stype == "personality_profile":
-                score += 30.0
-            elif stype in ("dominance_bluff_resolution", "alpha_reign"):
-                score += 15.0
-
-        scored_scenes.append((score, sc))
-
-    # Sort descending by score
-    selected_scenes = [sc for _, sc in sorted(scored_scenes, key=lambda x: x[0], reverse=True)]
-
-    gathered_pids: List[int] = []
-    for sc in selected_scenes:
-        # Fetch all contiguous paragraphs within this scene cluster
-        pids = list(range(sc["start_pid"], sc["end_pid"] + 1))
-        for pid in pids:
-            if pid not in gathered_pids:
-                gathered_pids.append(pid)
-            if len(gathered_pids) >= max_paragraphs:
-                break
-        if len(gathered_pids) >= max_paragraphs:
-            break
-
-    if not gathered_pids:
-        return []
-
-    # Query authentic paragraph texts directly from SQLite
-    placeholders = ",".join(["?"] * len(gathered_pids))
+    placeholders = ",".join(["?"] * len(pids))
     sql = f"""
     SELECT p.id, p.document_id, p.page_number, p.paragraph_index, p.display_text,
            d.title, d.author
@@ -460,8 +500,7 @@ def build_entity_evidence_bundle(
     WHERE p.id IN ({placeholders})
     ORDER BY p.id
     """
-    rows = conn.execute(sql, gathered_pids).fetchall()
-
+    rows = conn.execute(sql, pids).fetchall()
     bundle_items: List[Dict[str, Any]] = []
     for idx, r in enumerate(rows, 1):
         clean_text = (r[4] or "").strip()
@@ -475,10 +514,282 @@ def build_entity_evidence_bundle(
             "title": r[5],
             "author": r[6],
             "text_sha256": compute_text_sha256(clean_text),
-            "score": 1.0,  # Deterministic graph match
+            "score": 1.0,
         })
-
     return bundle_items
+
+
+def _gather_pids_from_scenes(scenes: List[Dict[str, Any]], max_paragraphs: int) -> List[int]:
+    """Gather contiguous PID runs from an ordered list of scenes, up to max_paragraphs."""
+    gathered: List[int] = []
+    for sc in scenes:
+        pids = list(range(sc["start_pid"], sc["end_pid"] + 1))
+        for pid in pids:
+            if pid not in gathered:
+                gathered.append(pid)
+            if len(gathered) >= max_paragraphs:
+                return gathered
+    return gathered
+
+
+def _score_scene_co_occurrence(conn: sqlite3.Connection, sc: Dict[str, Any], co_mentions: List[str]) -> float:
+    """Score a scene by co-occurrence of mentioned entity names in its text."""
+    if not co_mentions:
+        return 0.0
+    scene_text_row = conn.execute(
+        "SELECT GROUP_CONCAT(display_text, ' ') FROM paragraphs WHERE id BETWEEN ? AND ?",
+        (sc["start_pid"], sc["end_pid"]),
+    ).fetchone()
+    scene_text = (scene_text_row[0] or "").lower()
+    score = 0.0
+    for term in co_mentions:
+        if term.lower() in scene_text:
+            score += 50.0
+    return score
+
+
+def build_profile_bundle(
+    conn: sqlite3.Connection, entity_id: int, query: str, max_paragraphs: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Profile Bundle: Static portrait — personality, behavior, defining traits.
+    Prioritizes: personality_profile > dominance_bluff_resolution > alpha_reign > other
+    """
+    dossier = get_entity_dossier(conn, entity_id)
+    if not dossier or not dossier.get("scenes"):
+        return []
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for sc in dossier["scenes"]:
+        score = 0.0
+        stype = sc["scene_type"]
+        if stype == "personality_profile":
+            score += 30.0
+        elif stype in ("dominance_bluff_resolution", "confrontation"):
+            score += 20.0  # defining behavioral events
+        elif stype == "alpha_reign":
+            score += 15.0
+        elif stype == "social_interaction":
+            score += 10.0
+        scored.append((score, sc))
+
+    ordered = [sc for _, sc in sorted(scored, key=lambda x: x[0], reverse=True)]
+    pids = _gather_pids_from_scenes(ordered, max_paragraphs)
+    return _fetch_paragraphs_by_pids(conn, pids)
+
+
+def build_evolution_bundle(
+    conn: sqlite3.Connection, entity_id: int, query: str, max_paragraphs: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Evolution Bundle: Dynamic trajectory — how the entity changed over time.
+    Guarantees representation across EARLY (intro), MIDDLE (peak/turning point), LATE (demise/exit).
+    """
+    dossier = get_entity_dossier(conn, entity_id)
+    if not dossier or not dossier.get("scenes"):
+        return []
+
+    scenes = dossier["scenes"]  # already ordered by start_pid
+    n = len(scenes)
+
+    # Split into thirds: early / middle / late
+    early_end = max(1, n // 3)
+    late_start = n - max(1, n // 3)
+
+    early = scenes[:early_end]
+    middle = scenes[early_end:late_start] if early_end < late_start else []
+    late = scenes[late_start:]
+
+    # Prioritize demise/transition scenes within late
+    def _evo_score(sc: Dict[str, Any], phase: str) -> float:
+        stype = sc["scene_type"]
+        base = 0.0
+        if phase == "late":
+            if stype == "historical_demise":
+                base += 40.0
+            elif stype in ("confrontation", "alpha_reign"):
+                base += 20.0
+            else:
+                base += 10.0
+        elif phase == "early":
+            if stype == "personality_profile":
+                base += 30.0
+            else:
+                base += 15.0
+        else:  # middle
+            if stype in ("confrontation", "dominance_event", "dominance_bluff_resolution"):
+                base += 25.0
+            elif stype == "alpha_reign":
+                base += 20.0
+            else:
+                base += 10.0
+        return base
+
+    # Budget: allocate ~1/3 of max_paragraphs to each phase
+    budget_per_phase = max(2, max_paragraphs // 3)
+    remainder = max_paragraphs - budget_per_phase * 3
+
+    all_pids: List[int] = []
+
+    for phase_scenes, phase_name in [(early, "early"), (middle, "middle"), (late, "late")]:
+        scored = sorted(phase_scenes, key=lambda s: _evo_score(s, phase_name), reverse=True)
+        phase_budget = budget_per_phase + (remainder if phase_name == "late" else 0)
+        pids = _gather_pids_from_scenes(scored, phase_budget)
+        for pid in pids:
+            if pid not in all_pids:
+                all_pids.append(pid)
+
+    return _fetch_paragraphs_by_pids(conn, all_pids[:max_paragraphs])
+
+
+def build_relationship_bundle(
+    conn: sqlite3.Connection, entity_id: int, query: str, max_paragraphs: int = 12,
+    co_entity_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Relationship Bundle: Cross-entity dynamics — scenes where two entities co-occur.
+    Maximizes co-occurrence score, then falls back to individual entity scenes.
+    """
+    dossier = get_entity_dossier(conn, entity_id)
+    if not dossier or not dossier.get("scenes"):
+        return []
+
+    co_mentions = find_co_mentioned_terms(conn, query, entity_id)
+    # If we resolved a co-entity, add its aliases to co_mentions
+    if co_entity_id:
+        co_aliases = [r[0] for r in conn.execute(
+            "SELECT alias FROM entity_aliases WHERE entity_id = ?", (co_entity_id,)
+        ).fetchall()]
+        co_mentions = list(set(co_mentions + co_aliases))
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for sc in dossier["scenes"]:
+        score = _score_scene_co_occurrence(conn, sc, co_mentions)
+        # Boost confrontation/interaction scenes
+        stype = sc["scene_type"]
+        if stype in ("confrontation", "dominance_event", "dominance_bluff_resolution"):
+            score += 15.0
+        elif stype == "social_interaction":
+            score += 10.0
+        scored.append((score, sc))
+
+    ordered = [sc for _, sc in sorted(scored, key=lambda x: x[0], reverse=True)]
+    pids = _gather_pids_from_scenes(ordered, max_paragraphs)
+    return _fetch_paragraphs_by_pids(conn, pids)
+
+
+def build_affiliation_bundle(
+    conn: sqlite3.Connection, entity_id: int, query: str, max_paragraphs: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Affiliation Bundle: Social/group membership — family, troop, hierarchy, clan.
+    Prioritizes social_interaction > alpha_reign > other, with co-occurrence boost.
+    """
+    dossier = get_entity_dossier(conn, entity_id)
+    if not dossier or not dossier.get("scenes"):
+        return []
+
+    co_mentions = find_co_mentioned_terms(conn, query, entity_id)
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for sc in dossier["scenes"]:
+        score = _score_scene_co_occurrence(conn, sc, co_mentions)
+        stype = sc["scene_type"]
+        if stype == "social_interaction":
+            score += 30.0
+        elif stype == "alpha_reign":
+            score += 20.0
+        elif stype == "personality_profile":
+            score += 10.0
+        scored.append((score, sc))
+
+    ordered = [sc for _, sc in sorted(scored, key=lambda x: x[0], reverse=True)]
+    pids = _gather_pids_from_scenes(ordered, max_paragraphs)
+    return _fetch_paragraphs_by_pids(conn, pids)
+
+
+def build_timeline_bundle(
+    conn: sqlite3.Connection, entity_id: int, query: str, max_paragraphs: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Timeline Bundle: Chronological arc — even distribution from first to last appearance.
+    Samples scenes evenly across the full PID range to reconstruct the entity's life story.
+    """
+    dossier = get_entity_dossier(conn, entity_id)
+    if not dossier or not dossier.get("scenes"):
+        return []
+
+    scenes = dossier["scenes"]  # ordered by start_pid
+    n = len(scenes)
+
+    if n <= 4:
+        # Few scenes: take all, ordered chronologically
+        pids = _gather_pids_from_scenes(scenes, max_paragraphs)
+        return _fetch_paragraphs_by_pids(conn, pids)
+
+    # Even sampling: pick scenes at regular intervals
+    budget_per_scene = max(1, max_paragraphs // min(n, 6))
+    step = max(1, n // 6)  # aim for ~6 sample points
+    sampled_indices = list(range(0, n, step))
+    # Always include first and last
+    if 0 not in sampled_indices:
+        sampled_indices.insert(0, 0)
+    if (n - 1) not in sampled_indices:
+        sampled_indices.append(n - 1)
+
+    all_pids: List[int] = []
+    for idx in sampled_indices:
+        sc = scenes[idx]
+        pids = list(range(sc["start_pid"], sc["end_pid"] + 1))[:budget_per_scene]
+        for pid in pids:
+            if pid not in all_pids:
+                all_pids.append(pid)
+            if len(all_pids) >= max_paragraphs:
+                break
+        if len(all_pids) >= max_paragraphs:
+            break
+
+    return _fetch_paragraphs_by_pids(conn, all_pids[:max_paragraphs])
+
+
+def build_entity_evidence_bundle(
+    conn: sqlite3.Connection,
+    entity_id: int,
+    query: str,
+    max_paragraphs: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Phase 4.2 Dispatcher: Routes to specialized evidence bundle builder
+    based on fine-grained Entity Intent Classification.
+
+    Intent → Builder mapping:
+      profile       → build_profile_bundle
+      evolution     → build_evolution_bundle
+      relationship  → build_relationship_bundle
+      affiliation   → build_affiliation_bundle
+      timeline      → build_timeline_bundle
+    """
+    co_mentions = find_co_mentioned_terms(conn, query, entity_id)
+    co_entity = resolve_co_entity(conn, query, entity_id) if co_mentions else None
+    has_co_entity = co_entity is not None
+
+    entity_intent = detect_entity_intent(query, has_co_entity=has_co_entity)
+    logger.info(f"Entity intent for '{query[:50]}': {entity_intent} (co_entity={co_entity})")
+
+    if entity_intent == "profile":
+        return build_profile_bundle(conn, entity_id, query, max_paragraphs)
+    elif entity_intent == "evolution":
+        return build_evolution_bundle(conn, entity_id, query, max_paragraphs)
+    elif entity_intent == "relationship":
+        co_eid = co_entity["id"] if co_entity else None
+        return build_relationship_bundle(conn, entity_id, query, max_paragraphs, co_entity_id=co_eid)
+    elif entity_intent == "affiliation":
+        return build_affiliation_bundle(conn, entity_id, query, max_paragraphs)
+    elif entity_intent == "timeline":
+        return build_timeline_bundle(conn, entity_id, query, max_paragraphs)
+    else:
+        # Fallback to profile
+        return build_profile_bundle(conn, entity_id, query, max_paragraphs)
 
 
 def seed_pilot_nick(conn: sqlite3.Connection) -> int:

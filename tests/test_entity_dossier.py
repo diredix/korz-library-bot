@@ -180,3 +180,170 @@ def test_seed_all_pilots_and_routing():
     finally:
         lib.close()
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  Phase 4.2: Entity Intent Router Tests
+# ═══════════════════════════════════════════════════════════════════
+
+class TestDetectEntityIntent:
+    """Test fine-grained Entity Intent Classification."""
+
+    def test_profile_default(self):
+        assert korz_entity.detect_entity_intent("Яким був бабуїн Нік?") == "profile"
+
+    def test_profile_character(self):
+        assert korz_entity.detect_entity_intent("Який характер мав Соломон?") == "profile"
+
+    def test_evolution_changed(self):
+        assert korz_entity.detect_entity_intent("Як змінився Нік з часом?") == "evolution"
+
+    def test_evolution_fate(self):
+        assert korz_entity.detect_entity_intent("Як склалася доля Соломона?") == "evolution"
+
+    def test_evolution_death(self):
+        assert korz_entity.detect_entity_intent("Як Нік пішов з життя?") == "evolution"
+
+    def test_evolution_happened(self):
+        assert korz_entity.detect_entity_intent("Що сталося з Рут наприкінці?") == "evolution"
+
+    def test_evolution_lost_power(self):
+        assert korz_entity.detect_entity_intent("Як Соломон втратив владу?") == "evolution"
+
+    def test_relationship_with_co_entity(self):
+        assert korz_entity.detect_entity_intent(
+            "Який конфлікт був між Соломоном і Урією?", has_co_entity=True
+        ) == "relationship"
+
+    def test_relationship_incident(self):
+        assert korz_entity.detect_entity_intent(
+            "Який інцидент стався між Ніком і Рубеном?", has_co_entity=True
+        ) == "relationship"
+
+    def test_relationship_no_co_entity_falls_to_profile(self):
+        # Without co-entity, conflict patterns should NOT match relationship
+        result = korz_entity.detect_entity_intent(
+            "Який конфлікт мав Нік?", has_co_entity=False
+        )
+        assert result != "relationship"
+
+    def test_affiliation_family(self):
+        assert korz_entity.detect_entity_intent("Які стосунки мала Рут з родиною?") == "affiliation"
+
+    def test_affiliation_circle(self):
+        assert korz_entity.detect_entity_intent("Хто входив до кола Наомі?") == "affiliation"
+
+    def test_affiliation_dynasty(self):
+        assert korz_entity.detect_entity_intent("До якої династії належала Наомі?") == "affiliation"
+
+    def test_timeline_throughout(self):
+        assert korz_entity.detect_entity_intent("Що відомо про Ніка протягом книги?") == "timeline"
+
+    def test_timeline_full_story(self):
+        assert korz_entity.detect_entity_intent("Повна історія Соломона") == "timeline"
+
+
+class TestSpecializedBundleBuilders:
+    """Test that specialized builders dispatch and return valid evidence."""
+
+    @pytest.fixture(autouse=True)
+    def setup_real_db(self):
+        self.conn = sqlite3.connect("data/korz_library.sqlite")
+        korz_entity.seed_all_pilots(self.conn)
+        yield
+        self.conn.close()
+
+    def _get_entity_id(self, name):
+        row = self.conn.execute(
+            "SELECT id FROM entities WHERE canonical_name = ?", (name,)
+        ).fetchone()
+        return row[0]
+
+    def test_profile_bundle_nick(self):
+        eid = self._get_entity_id("Nick")
+        bundle = korz_entity.build_profile_bundle(self.conn, eid, "Яким був бабуїн Нік?")
+        assert len(bundle) > 0
+        pids = [b["paragraph_id"] for b in bundle]
+        # Personality PIDs should be prioritized
+        assert any(p in pids for p in [10208, 10209, 10210, 10211])
+
+    def test_evolution_bundle_solomon(self):
+        eid = self._get_entity_id("Solomon")
+        bundle = korz_entity.build_evolution_bundle(self.conn, eid, "Як склалася доля Соломона?")
+        assert len(bundle) > 0
+        pids = sorted([b["paragraph_id"] for b in bundle])
+        # Should span early to late: we need at least a 200+ PID spread
+        assert pids[-1] - pids[0] > 100, f"Evolution bundle too narrow: {pids[0]}..{pids[-1]}"
+
+    def test_relationship_bundle_solomon_uriah(self):
+        eid_sol = self._get_entity_id("Solomon")
+        # Find Uriah's entity if registered, or test with co_mentions
+        bundle = korz_entity.build_relationship_bundle(
+            self.conn, eid_sol,
+            "Який конфлікт був між Соломоном і Урією?",
+        )
+        assert len(bundle) > 0
+        # Check that co-occurrence PIDs (Solomon + Uriah scenes) are present
+        pids = [b["paragraph_id"] for b in bundle]
+        assert len(pids) > 0
+
+    def test_affiliation_bundle_naomi(self):
+        eid = self._get_entity_id("Naomi")
+        bundle = korz_entity.build_affiliation_bundle(self.conn, eid, "Хто входив до кола Наомі?")
+        assert len(bundle) > 0
+
+    def test_timeline_bundle_nick(self):
+        eid = self._get_entity_id("Nick")
+        bundle = korz_entity.build_timeline_bundle(self.conn, eid, "Повна історія Ніка")
+        assert len(bundle) > 0
+        pids = sorted([b["paragraph_id"] for b in bundle])
+        # Timeline should cover first and last scenes
+        assert pids[0] <= 10215  # early scenes
+        assert pids[-1] >= 10379  # late scenes (school visit or demise)
+
+    def test_dispatcher_routes_profile(self):
+        eid = self._get_entity_id("Nick")
+        bundle = korz_entity.build_entity_evidence_bundle(
+            self.conn, eid, "Яким був бабуїн Нік?"
+        )
+        assert len(bundle) > 0
+
+    def test_dispatcher_routes_evolution(self):
+        eid = self._get_entity_id("Solomon")
+        bundle = korz_entity.build_entity_evidence_bundle(
+            self.conn, eid, "Як змінився Соломон з часом?"
+        )
+        assert len(bundle) > 0
+
+    def test_dispatcher_routes_relationship(self):
+        eid = self._get_entity_id("Nick")
+        bundle = korz_entity.build_entity_evidence_bundle(
+            self.conn, eid, "Який інцидент стався між Ніком і Рубеном?"
+        )
+        assert len(bundle) > 0
+
+
+class TestResolveCOEntity:
+    """Test co-entity resolution for relationship queries."""
+
+    def test_resolves_second_entity(self):
+        conn = sqlite3.connect("data/korz_library.sqlite")
+        korz_entity.seed_all_pilots(conn)
+
+        nick_info = korz_entity.resolve_entity(conn, "Нік і Рут")
+        assert nick_info is not None
+
+        co = korz_entity.resolve_co_entity(conn, "Нік і Рут", nick_info["id"])
+        assert co is not None
+        assert co["canonical_name"] == "Ruth"
+        conn.close()
+
+    def test_no_co_entity_when_single(self):
+        conn = sqlite3.connect("data/korz_library.sqlite")
+        korz_entity.seed_all_pilots(conn)
+
+        nick_info = korz_entity.resolve_entity(conn, "Яким був Нік?")
+        assert nick_info is not None
+
+        co = korz_entity.resolve_co_entity(conn, "Яким був Нік?", nick_info["id"])
+        assert co is None
+        conn.close()
