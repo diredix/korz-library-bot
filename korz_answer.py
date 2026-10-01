@@ -226,7 +226,46 @@ class AnswerEngine:
         top_score = 0.0
         shadow_rrf_json = ""
 
-        if is_hybrid:
+        # Phase 4: Entity Dossier & Character Profiling Routing
+        entity_info = None
+        intent = "general"
+        try:
+            import korz_entity
+            entity_info = korz_entity.resolve_entity(self.lib.conn, clean_q)
+            intent = korz_entity.detect_character_intent(clean_q)
+        except Exception as e_err:
+            logger.debug(f"Entity resolution check skipped: {e_err}")
+
+        if entity_info and intent == "character_profiling":
+            import korz_entity
+            entity_bundle = korz_entity.build_entity_evidence_bundle(
+                self.lib.conn,
+                entity_id=entity_info["id"],
+                query=clean_q,
+                max_paragraphs=max(k, 12),
+            )
+            if entity_bundle:
+                sources = [
+                    AnswerSource(
+                        citation_index=b["citation_index"],
+                        paragraph_id=b["paragraph_id"],
+                        document_id=b["document_id"],
+                        author=b["author"],
+                        title=b["title"],
+                        page=b["page"],
+                        paragraph_index=b["paragraph_index"],
+                        text=b["text"],
+                        score=b["score"],
+                        text_sha256=b["text_sha256"],
+                    )
+                    for b in entity_bundle
+                ]
+                retrieval_mode = "entity_dossier"
+                top_score = 1.0
+
+        if sources and retrieval_mode == "entity_dossier":
+            pass  # Already resolved via deterministic Entity Dossier
+        elif is_hybrid:
             # 1. Dual Retrieval: Dense Semantic + FTS5 BM25
             dense_candidates = self.lib.ask(clean_q, limit=max(k * 2, 10), doc_id=doc_id)
             fts_candidates = self.lib._search_fts(clean_q, limit=max(k * 2, 10), doc_id=doc_id)
