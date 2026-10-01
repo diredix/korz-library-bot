@@ -62,10 +62,32 @@ class KorzConfig:
     answer_enabled: bool = field(
         default_factory=lambda: os.environ.get("KORZ_ANSWER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     )
+    retrieval_mode: str = field(
+        default_factory=lambda: os.environ.get("KORZ_RETRIEVAL_MODE", os.environ.get("KORZ_RETRIEVAL_BACKEND", "dense")).strip().lower()
+    )
+    shadow_rrf: bool = field(
+        default_factory=lambda: os.environ.get("KORZ_SHADOW_RRF", "0").strip().lower() in ("1", "true", "yes")
+    )
     fts_engine_version: str = "sqlite-fts5-bm25-v1.1"
 
     @classmethod
     def from_env(cls) -> "KorzConfig":
+        env_file = Path(".env")
+        if not env_file.exists():
+            env_file = Path(__file__).resolve().parent / ".env"
+        if env_file.exists():
+            try:
+                for line in env_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k not in os.environ or not os.environ[k]:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
         data_dir = Path(os.environ.get("KORZ_DATA_DIR", str(DEFAULT_DATA_DIR)))
         db_path = Path(os.environ.get("KORZ_DB_PATH", str(data_dir / "korz_library.sqlite")))
         sources_dir = data_dir / "sources"
@@ -73,6 +95,8 @@ class KorzConfig:
         semantic_enabled = os.environ.get("KORZ_SEMANTIC_ENABLED", "0").strip().lower() in ("1", "true", "yes")
         shadow_enabled = os.environ.get("KORZ_SHADOW_ENABLED", "0").strip().lower() in ("1", "true", "yes")
         answer_enabled = os.environ.get("KORZ_ANSWER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+        retrieval_mode = os.environ.get("KORZ_RETRIEVAL_MODE", os.environ.get("KORZ_RETRIEVAL_BACKEND", "dense")).strip().lower()
+        shadow_rrf = os.environ.get("KORZ_SHADOW_RRF", "0").strip().lower() in ("1", "true", "yes")
         return cls(
             data_dir=data_dir,
             db_path=db_path,
@@ -81,6 +105,8 @@ class KorzConfig:
             semantic_enabled=semantic_enabled,
             shadow_enabled=shadow_enabled,
             answer_enabled=answer_enabled,
+            retrieval_mode=retrieval_mode,
+            shadow_rrf=shadow_rrf,
         )
 
 
@@ -923,13 +949,46 @@ def _ensure_shadow_tables(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_answer_runs_created ON answer_runs(created_at);")
 
-    # Safe column migration for existing search_feedback tables
+    # Safe column migration for existing search_feedback and answer_runs tables
     try:
         cur_cols = [c[1] for c in conn.execute("PRAGMA table_info(search_feedback);").fetchall()]
         if "search_run_id" not in cur_cols:
             conn.execute("ALTER TABLE search_feedback ADD COLUMN search_run_id INTEGER;")
         if "answer_run_id" not in cur_cols:
             conn.execute("ALTER TABLE search_feedback ADD COLUMN answer_run_id INTEGER;")
+    except Exception:
+        pass
+
+    try:
+        ans_cols = [c[1] for c in conn.execute("PRAGMA table_info(answer_runs);").fetchall()]
+        if "model_tier" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN model_tier TEXT DEFAULT 'low';")
+        if "model_id" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN model_id TEXT DEFAULT '';")
+        if "adaptive_trigger" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN adaptive_trigger TEXT DEFAULT 'default';")
+        if "source_count" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN source_count INTEGER DEFAULT 0;")
+        if "book_count" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN book_count INTEGER DEFAULT 0;")
+        if "author_count" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN author_count INTEGER DEFAULT 0;")
+        if "prompt_version" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN prompt_version TEXT DEFAULT 'v1.0-grounded';")
+        if "answer_config_sha" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN answer_config_sha TEXT DEFAULT '';")
+        if "source_text_hashes" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN source_text_hashes TEXT DEFAULT '[]';")
+        if "corpus_version" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN corpus_version TEXT DEFAULT 'v1-baseline';")
+        if "experiment_input_sha" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN experiment_input_sha TEXT DEFAULT '';")
+        if "input_bundle_json" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN input_bundle_json TEXT DEFAULT '';")
+        if "retrieval_mode" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN retrieval_mode TEXT DEFAULT 'dense';")
+        if "shadow_rrf_json" not in ans_cols:
+            conn.execute("ALTER TABLE answer_runs ADD COLUMN shadow_rrf_json TEXT DEFAULT '';")
     except Exception:
         pass
 
@@ -3016,19 +3075,34 @@ class KorzLibrary:
         latency_ms: float = 0.0,
         search_run_id: Optional[int] = None,
         user_id: Optional[str] = None,
+        model_tier: str = "low",
+        model_id: str = "",
+        adaptive_trigger: str = "default",
+        source_count: int = 0,
+        book_count: int = 0,
+        author_count: int = 0,
+        prompt_version: str = "v1.0-grounded",
+        answer_config_sha: str = "",
+        source_text_hashes: Optional[List[str]] = None,
+        corpus_version: str = "v1-baseline",
+        experiment_input_sha: str = "",
+        input_bundle_json: str = "",
+        retrieval_mode: str = "dense",
+        shadow_rrf_json: str = "",
     ) -> int:
         """Logs an immutable answer run for answer quality telemetry."""
         now_iso = datetime.now(timezone.utc).isoformat()
         sources_json = json.dumps(source_paragraph_ids or [])
+        hashes_json = json.dumps(source_text_hashes or [])
         ans_hash = hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
         with self.conn:
             cur = self.conn.execute(
                 """
                 INSERT INTO answer_runs
-                (search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, source_text_hashes, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (search_run_id, query.strip(), backend, threshold, insufficient_info, sources_json, answer_text, ans_hash, citation_verified, round(latency_ms, 2), user_id, now_iso),
+                (search_run_id, query.strip(), backend, threshold, insufficient_info, sources_json, answer_text, ans_hash, citation_verified, round(latency_ms, 2), user_id, now_iso, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, hashes_json, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json),
             )
             return cur.lastrowid
 
@@ -3045,7 +3119,7 @@ class KorzLibrary:
     def get_answer_run(self, run_id: int) -> Optional[Dict[str, Any]]:
         """Retrieves historical answer run details by ID."""
         row = self.conn.execute(
-            "SELECT id, search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at FROM answer_runs WHERE id=?",
+            "SELECT id, search_run_id, query, backend, threshold, insufficient_info, source_paragraph_ids, answer_text, answer_sha256, citation_verified, latency_ms, user_id, created_at, model_tier, model_id, adaptive_trigger, source_count, book_count, author_count, prompt_version, answer_config_sha, source_text_hashes, corpus_version, experiment_input_sha, input_bundle_json, retrieval_mode, shadow_rrf_json FROM answer_runs WHERE id=?",
             (run_id,)
         ).fetchone()
         if not row:

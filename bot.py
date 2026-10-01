@@ -53,6 +53,7 @@ dp = Dispatcher()
 lib: Optional[KorzLibrary] = None
 shadow_runner: Optional[ShadowRunner] = None
 ALLOWED_USERS: Set[int] = set()
+BOT_USERNAME: str = "saniarationalshelfbot"
 _last_user_query: Dict[str, Tuple[str, str]] = {}
 
 MAX_QUERY_LENGTH = 500
@@ -78,8 +79,17 @@ def load_env_config() -> dict:
         "allowed_users": "",
     }
 
-    # 1. Load from .env file
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+    except Exception:
+        pass
+
+    # 1. Load from .env file and ensure os.environ is fully populated
     env_file = Path(".env")
+    if not env_file.exists():
+        env_file = Path(__file__).resolve().parent / ".env"
+
     if env_file.exists():
         for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -89,6 +99,7 @@ def load_env_config() -> dict:
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip().strip('"').strip("'")
+                os.environ[k] = v
                 if k == "TELEGRAM_BOT_TOKEN" and v:
                     config["token"] = v
                 elif k == "ALLOWED_TELEGRAM_USERS" and v:
@@ -103,22 +114,78 @@ def load_env_config() -> dict:
     return config
 
 
+_group_admins_cache: Dict[int, Tuple[float, Set[int]]] = {}
+
+
 def parse_allowed_users(raw: str) -> Set[int]:
-    """Parse comma/space-separated Telegram user IDs into a set of ints."""
+    """Parse comma/space-separated Telegram user or chat IDs into a set of ints."""
     ids = set()
     for item in re.split(r"[,;\s]+", raw):
         item = item.strip()
-        if item.isdigit():
+        if re.match(r"^-?\d+$", item):
             ids.add(int(item))
     return ids
 
 
 def is_user_allowed(user_id: int) -> bool:
-    """Check if user is authorized."""
+    """Check if user or chat ID is authorized."""
     if not ALLOWED_USERS:
         # If no allowlist is configured, permit (with warning logged at startup)
         return True
     return user_id in ALLOWED_USERS
+
+
+async def is_event_authorized(event: types.Message | types.CallbackQuery) -> bool:
+    """
+    Comprehensive authorization check:
+      1. If ALLOWED_USERS is empty, allow all.
+      2. If user.id in ALLOWED_USERS, allow.
+      3. If sender_chat and sender_chat.id in ALLOWED_USERS, allow.
+      4. If chat and chat.id in ALLOWED_USERS, allow.
+      5. If user is GroupAnonymousBot (1087968824) in a group:
+         Grant access if group ID is allowed, or if any admin of the group is in ALLOWED_USERS.
+    """
+    if not ALLOWED_USERS:
+        return True
+
+    user = event.from_user
+    if user and user.id in ALLOWED_USERS:
+        return True
+
+    sender_chat = getattr(event, "sender_chat", None)
+    if sender_chat and sender_chat.id in ALLOWED_USERS:
+        return True
+
+    chat = getattr(event, "chat", None)
+    if not chat and isinstance(event, types.CallbackQuery) and event.message:
+        chat = event.message.chat
+
+    if chat and chat.id in ALLOWED_USERS:
+        return True
+
+    # Anonymous Administrator support (Telegram ID: 1087968824 @GroupAnonymousBot)
+    if user and user.id == 1087968824 and chat and getattr(chat, "type", "") in ("group", "supergroup"):
+        now = time.time()
+        cached = _group_admins_cache.get(chat.id)
+        if cached and (now - cached[0] < 300):
+            admin_ids = cached[1]
+        else:
+            try:
+                bot_instance = getattr(event, "bot", None)
+                if bot_instance:
+                    admins = await bot_instance.get_chat_administrators(chat.id)
+                    admin_ids = {a.user.id for a in admins}
+                    _group_admins_cache[chat.id] = (now, admin_ids)
+                else:
+                    admin_ids = set()
+            except Exception as e:
+                logger.warning(f"Failed to fetch administrators for chat {chat.id}: {e}")
+                admin_ids = set()
+
+        if admin_ids & ALLOWED_USERS:
+            return True
+
+    return False
 
 
 def split_telegram_message(text: str, max_chars: int = MAX_TELEGRAM_MSG_LEN) -> List[str]:
@@ -157,11 +224,15 @@ async def check_auth_or_reject(event: types.Message | types.CallbackQuery) -> bo
     if not user:
         return False
 
-    if not is_user_allowed(user.id):
+    if not await is_event_authorized(event):
         logger.warning(f"Unauthorized access attempt from user_id={user.id} (@{user.username})")
-        rejection_msg = "⛔ <b>Доступ до цього бота обмежено.</b>"
         if isinstance(event, types.Message):
-            await event.answer(rejection_msg, parse_mode=ParseMode.HTML)
+            is_group = bool(getattr(event, "chat", None) and getattr(event.chat, "type", "") in ("group", "supergroup"))
+            raw_text = (event.text or "").lower()
+            # Only send rejection in private chat, or if explicitly addressing the bot in group
+            if not is_group or (BOT_USERNAME and f"@{BOT_USERNAME}" in raw_text) or raw_text.startswith("/"):
+                rejection_msg = "⛔ <b>Доступ до цього бота обмежено.</b>"
+                await event.answer(rejection_msg, parse_mode=ParseMode.HTML)
         elif isinstance(event, types.CallbackQuery):
             await event.answer("Доступ обмежено", show_alert=True)
         return False
@@ -317,6 +388,18 @@ async def cb_context(callback: types.CallbackQuery):
         await callback.answer("Помилка завантаження контексту", show_alert=True)
 
 
+def clean_user_query(text: str) -> str:
+    """Strips bot mentions and leading command prefixes (/answer, /ask, /search) from user queries."""
+    if not text:
+        return ""
+    if BOT_USERNAME:
+        text = re.sub(rf"@{re.escape(BOT_USERNAME)}\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"@SaniaRationalShelfBot\b", "", text, flags=re.IGNORECASE).strip()
+    text = text.lstrip(":, -–—").strip()
+    text = re.sub(r"^/(?:answer|ask|search)\b", "", text, flags=re.IGNORECASE).strip()
+    return text.lstrip(":, -–—").strip()
+
+
 @dp.message(Command("ask"))
 async def cmd_ask(message: types.Message):
     if not await check_auth_or_reject(message):
@@ -336,7 +419,20 @@ async def cmd_ask(message: types.Message):
         )
         return
 
-    question = parts[1].strip()
+    question = clean_user_query(parts[1])
+
+    if not question:
+        await message.answer(
+            "🧠 <b>Смисловий пошук думок (/ask):</b>\n\n"
+            "Введіть питання людською мовою або концептуальну ідею після команди:\n"
+            "• <code>/ask Чому забезпечене життя не усуває стрес?</code>\n"
+            "• <code>/ask Де Коржибський говорить що карта не є територією?</code>\n"
+            "• <code>/ask Чому гроші можуть стати непотрібними у майбутньому?</code>\n\n"
+            "💡 <i>KORZ виконає векторний пошук за змістом (dense embeddings).</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if len(question) > MAX_QUERY_LENGTH:
         await message.answer(
             f"⚠️ <b>Питання занадто довге</b> ({len(question)} символів).\n"
@@ -451,26 +547,11 @@ async def cmd_ask(message: types.Message):
         )
 
 
-@dp.message(Command("answer"))
-async def cmd_answer(message: types.Message):
-    if not await check_auth_or_reject(message):
-        return
+async def _execute_answer_workflow(message: types.Message, question: str):
+    """Executes the Grounded Answer Engine workflow (extractive or Gemini generative)."""
+    question = clean_user_query(question)
 
-    # Check feature flag
-    if not lib.config.answer_enabled:
-        await message.answer(
-            "⚠️ <b>Режим /answer наразі вимкнено (Experimental Phase).</b>\n\n"
-            "Цей режим формує вичерпну відповідь на основі уривків із книг (Extractive / Grounded LLM).\n\n"
-            "Щоб активувати його, додайте у файл <code>.env</code>:\n"
-            "<code>KORZ_ANSWER_ENABLED=1</code>\n\n"
-            "Та перезапустіть бота.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    raw_text = message.text or ""
-    parts = raw_text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
+    if not question:
         await message.answer(
             "📚 <b>Як користуватися режимом /answer (Grounded Answer Engine):</b>\n\n"
             "Введіть питання, на яке хочете отримати обґрунтовану відповідь за книгами:\n"
@@ -482,7 +563,6 @@ async def cmd_answer(message: types.Message):
         )
         return
 
-    question = parts[1].strip()
     if len(question) > MAX_QUERY_LENGTH:
         await message.answer(
             f"⚠️ <b>Питання занадто довге</b> ({len(question)} символів).\n"
@@ -522,6 +602,20 @@ async def cmd_answer(message: types.Message):
                 latency_ms=latency,
                 search_run_id=search_run_id,
                 user_id=str(message.from_user.id) if message.from_user else None,
+                model_tier=getattr(res, "model_tier", "low"),
+                model_id=getattr(res, "model_id", "gemini-3.8-flash-low"),
+                adaptive_trigger=getattr(res, "adaptive_trigger", "default"),
+                source_count=len(res.sources),
+                book_count=getattr(res, "book_count", 0),
+                author_count=getattr(res, "author_count", 0),
+                prompt_version=getattr(res, "prompt_version", "v1.0-grounded"),
+                answer_config_sha=getattr(res, "answer_config_sha", ""),
+                source_text_hashes=getattr(res, "source_text_hashes", []),
+                corpus_version=getattr(getattr(lib, "config", None), "corpus_version", "v1-baseline"),
+                experiment_input_sha=getattr(res, "experiment_input_sha", ""),
+                input_bundle_json=getattr(res, "input_bundle_json", ""),
+                retrieval_mode=getattr(res, "retrieval_mode", "dense"),
+                shadow_rrf_json=getattr(res, "shadow_rrf_json", ""),
             )
 
         if res.insufficient_info:
@@ -536,11 +630,16 @@ async def cmd_answer(message: types.Message):
         clean_q = html.escape(question)
         if res.mode == "extractive" and res.fallback_reason:
             clean_fb = html.escape(res.fallback_reason)
-            mode_badge = f"Extractive (source-bound, fallback: {clean_fb})"
+            mode_badge = f"Extractive (fallback: {clean_fb})"
         elif res.mode == "extractive":
-            mode_badge = "Extractive (source-bound)"
+            mode_badge = "Extractive"
         else:
-            mode_badge = "Generative LLM (з верифікацією джерел)"
+            tier_badge = {
+                "high": "🧠 High (--deep)",
+                "medium": "⚖️ Medium (adaptive)",
+                "low": "⚡ Low",
+            }.get(getattr(res, "model_tier", "low"), "⚡ Low")
+            mode_badge = f"Gemini 3.8 Flash [{tier_badge}]"
 
         header = (
             f"📚 <b>Відповідь за бібліотекою KORZ:</b>\n"
@@ -602,20 +701,45 @@ async def cmd_answer(message: types.Message):
         )
 
 
-@dp.message()
-async def handle_query(message: types.Message):
+@dp.message(Command("answer"))
+async def cmd_answer(message: types.Message):
     if not await check_auth_or_reject(message):
         return
 
-    raw_query = message.text or ""
-    query = raw_query.strip()
-    if not query:
+    # Check feature flag
+    if not getattr(getattr(lib, "config", None), "answer_enabled", False):
+        await message.answer(
+            "⚠️ <b>Режим /answer наразі вимкнено (Experimental Phase).</b>\n\n"
+            "Цей режим формує вичерпну відповідь на основі уривків із книг (Extractive / Grounded LLM).\n\n"
+            "Щоб активувати його, додайте у файл <code>.env</code>:\n"
+            "<code>KORZ_ANSWER_ENABLED=1</code>\n\n"
+            "Та перезапустіть бота.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    if message.from_user:
-        _last_user_query[str(message.from_user.id)] = (query, "search")
+    raw_text = message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    question = parts[1].strip() if len(parts) > 1 else ""
+    await _execute_answer_workflow(message, question)
 
-    # Check query length limit
+
+async def _execute_search_workflow(message: types.Message, query: str):
+    """Executes the standard FTS5 / BM25 search workflow."""
+    query = clean_user_query(query)
+
+    if not query:
+        await message.answer(
+            "🔍 <b>Текстовий пошук за точними словами (/search):</b>\n\n"
+            "Введіть ключові слова або фрази для пошуку по книгах:\n"
+            "• <code>/search бабуїни стрес</code>\n"
+            "• <code>/search семантична реакція</code>\n"
+            "• <code>/search ресурсоорієнтована економіка</code>\n\n"
+            "💡 <i>KORZ знайде точні збіги цитат у текстах за алгоритмом FTS5 / BM25.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if len(query) > MAX_QUERY_LENGTH:
         await message.answer(
             f"⚠️ <b>Запит занадто довгий</b> ({len(query)} символів).\n"
@@ -624,13 +748,14 @@ async def handle_query(message: types.Message):
         )
         return
 
+    if message.from_user:
+        _last_user_query[str(message.from_user.id)] = (query, "search")
+
     try:
-        # Canonical search via korz_core.search (read-only, shadow handled explicitly async)
         t0 = time.perf_counter()
         results = lib.search(query, mode="auto", limit=3, shadow=False)
         latency_fts = (time.perf_counter() - t0) * 1000
 
-        # Non-blocking background shadow evaluation (never delays user response)
         if lib.config.shadow_enabled and shadow_runner:
             asyncio.create_task(
                 shadow_runner.evaluate_async(
@@ -672,7 +797,6 @@ async def handle_query(message: types.Message):
             title_str = html.escape(r.title)
             sanitized_text = html.escape(r.text)
 
-            # Limit preview length
             if len(sanitized_text) > 850:
                 sanitized_text = sanitized_text[:840] + "..."
 
@@ -699,7 +823,6 @@ async def handle_query(message: types.Message):
 
             await message.answer(msg_text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-        # Rating prompt for evaluation telemetry
         fb_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -722,6 +845,83 @@ async def handle_query(message: types.Message):
             "❌ Сталася помилка під час обробки пошуку. Спробуйте пізніше або змініть формулювання.",
             parse_mode=ParseMode.HTML,
         )
+
+
+@dp.message(Command("search"))
+async def cmd_search(message: types.Message):
+    if not await check_auth_or_reject(message):
+        return
+
+    raw_text = message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    await _execute_search_workflow(message, query)
+
+
+@dp.message()
+async def handle_query(message: types.Message):
+    raw_query = message.text or ""
+    if not raw_query.strip():
+        return
+
+    chat_type = getattr(getattr(message, "chat", None), "type", "")
+    is_group = chat_type in ("group", "supergroup")
+
+    if is_group:
+        has_mention = False
+        bot_tag = f"@{BOT_USERNAME}".lower() if BOT_USERNAME else "@saniarationalshelfbot"
+        if bot_tag in raw_query.lower():
+            has_mention = True
+        elif message.entities:
+            for entity in message.entities:
+                if entity.type == "mention":
+                    m_text = raw_query[entity.offset:entity.offset + entity.length].lower()
+                    if (BOT_USERNAME and m_text == f"@{BOT_USERNAME}".lower()) or m_text == "@saniarationalshelfbot":
+                        has_mention = True
+                        break
+
+        is_reply_to_bot = False
+        if message.reply_to_message and message.reply_to_message.from_user:
+            reply_user = message.reply_to_message.from_user
+            if BOT_USERNAME and (reply_user.username or "").lower() == BOT_USERNAME.lower():
+                is_reply_to_bot = True
+            elif getattr(message.bot, "id", None) and reply_user.id == message.bot.id:
+                is_reply_to_bot = True
+
+        # In groups, ignore chatter that doesn't mention or reply to the bot
+        if not (has_mention or is_reply_to_bot):
+            return
+
+    # Check authorization (only authorized users can query the bot)
+    if not await check_auth_or_reject(message):
+        return
+
+    clean_query = clean_user_query(raw_query)
+
+    if is_group:
+        clean_clean = clean_query.strip().lstrip("/").strip()
+        if not clean_clean:
+            await message.answer(
+                "👋 <b>Я на зв'язку!</b> Задайте мені запитання по книгах бібліотеки KORZ.\n\n"
+                "Наприклад:\n"
+                f"• <code>@{BOT_USERNAME or 'SaniaRationalShelfBot'} Чому виникає відчуття тривоги?</code>\n"
+                f"• <code>@{BOT_USERNAME or 'SaniaRationalShelfBot'} Що Коржибський писав про карту і територію?</code>\n\n"
+                "Або використовуйте команди:\n"
+                "• /answer &lt;питання&gt; — синтез відповіді (Gemini 3.8 Flash)\n"
+                "• /ask &lt;думка&gt; — семантичний пошук\n"
+                "• /books — каталог книг у бібліотеці",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # In groups, when directly addressed, prefer Grounded Answer Engine (Gemini synthesis) if enabled
+        if getattr(getattr(lib, "config", None), "answer_enabled", False):
+            await _execute_answer_workflow(message, clean_query)
+        else:
+            await _execute_search_workflow(message, clean_query)
+    else:
+        # In private chat, plain text defaults to search workflow
+        await _execute_search_workflow(message, clean_query)
 
 
 @dp.callback_query(F.data.startswith("fb:"))
@@ -877,7 +1077,20 @@ async def main():
     bot = Bot(token=token)
 
     try:
-        bot_info = await bot.get_me()
+        bot_info = None
+        for attempt in range(1, 6):
+            try:
+                bot_info = await bot.get_me()
+                break
+            except Exception as conn_err:
+                logger.warning(f"⚠️ Спроба підключення {attempt}/5 до Telegram не вдалася ({conn_err}). Очікування {attempt * 2} с...")
+                await asyncio.sleep(attempt * 2)
+
+        if not bot_info:
+            bot_info = await bot.get_me()
+
+        global BOT_USERNAME
+        BOT_USERNAME = (bot_info.username or "saniarationalshelfbot").lower()
         masked = mask_token(token)
         logger.info(f"🤖 KORZ Telegram Bot успішно підключено: @{bot_info.username} (Token: {masked})")
         logger.info("📚 Підключено до локальної бібліотеки SQLite. Очікування запитів...")

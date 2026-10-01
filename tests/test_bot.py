@@ -229,6 +229,90 @@ class TestBotHardening(unittest.TestCase):
             self.assertEqual(ans_fb_row[1], "Як Фреско пояснює відмову від грошей?")
             self.assertEqual(ans_fb_row[2], "answer_accurate")
 
+    def test_group_ignore_unaddressed_chatter(self):
+        """In a group, messages not mentioning or replying to the bot must be completely ignored."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import bot
+
+        mock_msg = MagicMock()
+        mock_msg.chat.type = "group"
+        mock_msg.text = "Привіт усім у чаті, як справи?"
+        mock_msg.entities = []
+        mock_msg.reply_to_message = None
+        mock_msg.from_user.id = 12345
+        mock_msg.answer = AsyncMock()
+
+        asyncio.run(bot.handle_query(mock_msg))
+        self.assertEqual(mock_msg.answer.call_count, 0)
+
+    def test_group_mention_cleaning_and_routing(self):
+        """In a group, addressing @SaniaRationalShelfBot cleans mention and executes query."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import bot
+        from korz_core import KorzLibrary
+
+        with KorzLibrary() as library:
+            bot.lib = library
+            mock_msg = MagicMock()
+            mock_msg.chat.type = "supergroup"
+            mock_msg.text = "@SaniaRationalShelfBot: поведінка"
+            mock_msg.entities = []
+            mock_msg.reply_to_message = None
+            mock_msg.from_user.id = 12345
+            mock_msg.answer = AsyncMock()
+
+            asyncio.run(bot.handle_query(mock_msg))
+            self.assertGreaterEqual(mock_msg.answer.call_count, 1)
+            sent_texts = [call[0][0] for call in mock_msg.answer.call_args_list]
+            self.assertFalse(any("Сталася помилка" in t for t in sent_texts))
+
+    def test_group_mention_empty_query_guidance(self):
+        """Mentioning only the bot in a group displays a greeting and usage examples."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import bot
+
+        mock_msg = MagicMock()
+        mock_msg.chat.type = "group"
+        mock_msg.text = "@SaniaRationalShelfBot"
+        mock_msg.entities = []
+        mock_msg.reply_to_message = None
+        mock_msg.from_user.id = 12345
+        mock_msg.answer = AsyncMock()
+
+        asyncio.run(bot.handle_query(mock_msg))
+        self.assertEqual(mock_msg.answer.call_count, 1)
+        sent_text = mock_msg.answer.call_args[0][0]
+        self.assertIn("Я на зв'язку", sent_text)
+
+    def test_cmd_search_execution(self):
+        """Verify /search executes FTS search or shows guidance when empty."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import bot
+        from korz_core import KorzLibrary
+
+        with KorzLibrary() as library:
+            bot.lib = library
+            mock_empty = MagicMock()
+            mock_empty.from_user.id = 12345
+            mock_empty.text = "/search"
+            mock_empty.answer = AsyncMock()
+
+            asyncio.run(bot.cmd_search(mock_empty))
+            self.assertEqual(mock_empty.answer.call_count, 1)
+            self.assertIn("Текстовий пошук за точними словами", mock_empty.answer.call_args[0][0])
+
+            mock_q = MagicMock()
+            mock_q.from_user.id = 12345
+            mock_q.text = "/search бабуїни стрес"
+            mock_q.answer = AsyncMock()
+
+            asyncio.run(bot.cmd_search(mock_q))
+            self.assertGreaterEqual(mock_q.answer.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

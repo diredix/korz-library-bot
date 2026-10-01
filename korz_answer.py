@@ -24,6 +24,7 @@ Architectural Pipeline:
     Structured AnswerResult with verifiable source paragraph_ids and page numbers.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -32,11 +33,61 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from korz_core import KorzLibrary, SearchResult
+from korz_core import KorzLibrary, SearchResult, compute_simulated_rrf
 
 logger = logging.getLogger("korz_answer")
+
+PROMPT_VERSION = "v1.0-grounded"
+
+
+def compute_text_sha256(text: str) -> str:
+    """Computes a 16-char sha256 of passage text for provenance verification."""
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def compute_config_sha(config: "AnswerConfig", prompt_version: str = PROMPT_VERSION) -> str:
+    """Computes a deterministic hash of answer parameters for provenance and replayability."""
+    payload = f"{config.backend}:{config.retrieval_mode}:{config.gemini_model}:{config.min_similarity:.4f}:{config.top_k}:{config.max_sentences}:{prompt_version}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def build_experiment_bundle(
+    query: str,
+    sources: List["AnswerSource"],
+    prompt_version: str = PROMPT_VERSION,
+    config_sha: str = "",
+    retrieval_mode: str = "dense",
+) -> Tuple[Dict[str, Any], str, str]:
+    """
+    Builds the canonical immutable input bundle and computes experiment_input_sha256.
+    Returns: (bundle_dict, canonical_json_string, experiment_input_sha256)
+    """
+    bundle = {
+        "query": query,
+        "prompt_version": prompt_version,
+        "config_sha": config_sha,
+        "retrieval_mode": retrieval_mode,
+        "sources": [
+            {
+                "citation_index": s.citation_index,
+                "paragraph_id": s.paragraph_id,
+                "document_id": s.document_id,
+                "author": s.author,
+                "title": s.title,
+                "page": s.page,
+                "paragraph_index": s.paragraph_index,
+                "text": s.text,
+                "text_sha256": s.text_sha256,
+            }
+            for s in sources
+        ],
+    }
+    canonical_json = json.dumps(bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    input_sha = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    return bundle, canonical_json, input_sha
 
 
 @dataclass(frozen=True)
@@ -51,6 +102,7 @@ class AnswerSource:
     paragraph_index: int
     text: str
     score: float
+    text_sha256: str = ""
 
 
 @dataclass
@@ -59,7 +111,19 @@ class AnswerResult:
     question: str
     answer_text: str
     sources: List[AnswerSource] = field(default_factory=list)
-    mode: str = "extractive"  # 'extractive' | 'generative'
+    mode: str = "extractive"  # 'extractive' | 'gemini' | 'generative'
+    retrieval_mode: str = "dense"  # 'dense' | 'rrf' | 'hybrid'
+    shadow_rrf_json: str = ""
+    model_tier: str = "low"   # 'low' | 'medium' | 'high'
+    model_id: str = ""        # e.g. 'gemini-3.8-flash-low'
+    adaptive_trigger: str = "default"  # 'default' | 'explicit_deep' | 'adaptive_comparison' | 'adaptive_multi_author' | 'adaptive_multi_book'
+    book_count: int = 0
+    author_count: int = 0
+    prompt_version: str = PROMPT_VERSION
+    answer_config_sha: str = ""
+    source_text_hashes: List[str] = field(default_factory=list)
+    experiment_input_sha: str = ""
+    input_bundle_json: str = ""
     latency_ms: float = 0.0
     confidence_score: float = 0.0
     is_grounded: bool = True
@@ -74,7 +138,10 @@ class AnswerConfig:
     """Configuration for AnswerEngine."""
     enabled: bool = False
     backend: str = "extractive"  # 'extractive' | 'gemini' | 'ollama' | 'auto'
+    retrieval_mode: str = "dense"  # 'dense' | 'rrf' | 'hybrid'
+    shadow_rrf: bool = False       # Log shadow RRF when retrieval_mode is dense
     gemini_model: str = "gemini-3.8-flash-low"
+    adaptive_thinking: bool = False  # Feature flag: default False (0)
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.2:3b"
     min_similarity: float = 0.82
@@ -83,10 +150,29 @@ class AnswerConfig:
 
     @classmethod
     def from_env(cls) -> "AnswerConfig":
+        env_file = Path(".env")
+        if not env_file.exists():
+            env_file = Path(__file__).resolve().parent / ".env"
+        if env_file.exists():
+            try:
+                for line in env_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k not in os.environ or not os.environ[k]:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
         return cls(
             enabled=os.environ.get("KORZ_ANSWER_ENABLED", "0").strip() in ("1", "true", "True"),
             backend=os.environ.get("KORZ_ANSWER_BACKEND", "extractive").strip().lower(),
+            retrieval_mode=os.environ.get("KORZ_RETRIEVAL_MODE", os.environ.get("KORZ_RETRIEVAL_BACKEND", "dense")).strip().lower(),
+            shadow_rrf=os.environ.get("KORZ_SHADOW_RRF", "0").strip().lower() in ("1", "true", "yes"),
             gemini_model=os.environ.get("KORZ_GEMINI_MODEL", "gemini-3.8-flash-low").strip(),
+            adaptive_thinking=os.environ.get("KORZ_ADAPTIVE_THINKING", "0").strip() in ("1", "true", "True"),
             ollama_url=os.environ.get("KORZ_OLLAMA_URL", "http://localhost:11434").strip(),
             ollama_model=os.environ.get("KORZ_OLLAMA_MODEL", "llama3.2:3b").strip(),
             min_similarity=float(os.environ.get("KORZ_ANSWER_MIN_SIMILARITY", "0.82")),
@@ -119,73 +205,195 @@ class AnswerEngine:
           - 'generative': Synthesized grounded answer via local Ollama LLM.
           - 'auto': Use generative if Ollama is available, otherwise extractive.
         """
-        clean_q = question.strip()
+        # Detect explicit --deep flag
+        deep_flag = bool(re.search(r"(?:^|\s)--deep(?:\s|$)", question, re.IGNORECASE))
+        clean_q = re.sub(r"(?:^|\s)--deep(?:\s|$)", " ", question, flags=re.IGNORECASE).strip()
+        retrieval_mode = (self.config.retrieval_mode or "dense").lower()
         if not clean_q:
             return AnswerResult(
                 question="",
                 answer_text="Питання не може бути порожнім.",
+                retrieval_mode=retrieval_mode,
                 insufficient_info=True,
             )
 
         t0 = time.perf_counter()
         target_mode = mode or self.config.backend
         k = limit or self.config.top_k
+        is_hybrid = retrieval_mode in ("rrf", "hybrid")
 
-        # 1. Retrieve candidates via E5 semantic retrieval
-        passages = self.lib.ask(clean_q, limit=k, doc_id=doc_id)
-        if not passages:
-            elapsed = (time.perf_counter() - t0) * 1000
-            return AnswerResult(
-                question=clean_q,
-                answer_text="У бібліотеці не знайдено матеріалів, пов'язаних із цим запитанням.",
-                sources=[],
-                latency_ms=elapsed,
-                insufficient_info=True,
-            )
-
-        # 2. Check confidence threshold
-        top_score = passages[0].score
-        if top_score < self.config.min_similarity:
-            elapsed = (time.perf_counter() - t0) * 1000
-            return AnswerResult(
-                question=clean_q,
-                answer_text=(
-                    "У знайдених фрагментах недостатньо релевантної інформації, "
-                    f"щоб надійно відповісти на це питання (максимальна схожість: {top_score:.3f} < {self.config.min_similarity:.2f})."
-                ),
-                sources=[],
-                latency_ms=elapsed,
-                confidence_score=top_score,
-                insufficient_info=True,
-            )
-
-        # 3. Build verified AnswerSource list
         sources: List[AnswerSource] = []
-        for idx, p in enumerate(passages, 1):
-            sources.append(
-                AnswerSource(
-                    citation_index=idx,
-                    paragraph_id=p.paragraph_id,
-                    document_id=p.document_id,
-                    author=p.author,
-                    title=p.title,
-                    page=p.page,
-                    paragraph_index=p.paragraph_index,
-                    text=p.text.strip(),
-                    score=p.score,
+        top_score = 0.0
+        shadow_rrf_json = ""
+
+        if is_hybrid:
+            # 1. Dual Retrieval: Dense Semantic + FTS5 BM25
+            dense_candidates = self.lib.ask(clean_q, limit=max(k * 2, 10), doc_id=doc_id)
+            fts_candidates = self.lib._search_fts(clean_q, limit=max(k * 2, 10), doc_id=doc_id)
+
+            if not dense_candidates and not fts_candidates:
+                elapsed = (time.perf_counter() - t0) * 1000
+                return AnswerResult(
+                    question=clean_q,
+                    answer_text="У бібліотеці не знайдено матеріалів, пов'язаних із цим запитанням.",
+                    sources=[],
+                    retrieval_mode=retrieval_mode,
+                    latency_ms=elapsed,
+                    insufficient_info=True,
                 )
+
+            dense_top_score = dense_candidates[0].score if dense_candidates else 0.0
+            top_score = dense_top_score
+
+            # Insufficient Information Gate for Hybrid:
+            if dense_top_score < self.config.min_similarity:
+                elapsed = (time.perf_counter() - t0) * 1000
+                return AnswerResult(
+                    question=clean_q,
+                    answer_text=(
+                        "У знайдених фрагментах недостатньо релевантної інформації, "
+                        f"щоб надійно відповісти на це питання (максимальна схожість: {dense_top_score:.3f} < {self.config.min_similarity:.2f})."
+                    ),
+                    sources=[],
+                    retrieval_mode=retrieval_mode,
+                    latency_ms=elapsed,
+                    confidence_score=dense_top_score,
+                    insufficient_info=True,
+                )
+
+            # Simple RRF Fusion (k=60)
+            rrf_items, ov5, ov10, top1_match = compute_simulated_rrf(
+                fts_results=fts_candidates,
+                semantic_results=dense_candidates,
+                k=60,
+                top_limit=k,
             )
+
+            if not rrf_items:
+                elapsed = (time.perf_counter() - t0) * 1000
+                return AnswerResult(
+                    question=clean_q,
+                    answer_text="У бібліотеці не знайдено матеріалів, пов'язаних із цим запитанням.",
+                    sources=[],
+                    retrieval_mode=retrieval_mode,
+                    latency_ms=elapsed,
+                    insufficient_info=True,
+                )
+
+            cand_map: Dict[int, SearchResult] = {r.paragraph_id: r for r in (dense_candidates + fts_candidates)}
+
+            for idx, item in enumerate(rrf_items, 1):
+                pid = item["paragraph_id"]
+                cand = cand_map.get(pid)
+                if not cand:
+                    continue
+                clean_p_text = cand.text.strip()
+                p_sha = compute_text_sha256(clean_p_text)
+                sources.append(
+                    AnswerSource(
+                        citation_index=idx,
+                        paragraph_id=cand.paragraph_id,
+                        document_id=cand.document_id,
+                        author=cand.author,
+                        title=cand.title,
+                        page=cand.page,
+                        paragraph_index=cand.paragraph_index,
+                        text=clean_p_text,
+                        score=float(item.get("score", cand.score)),
+                        text_sha256=p_sha,
+                    )
+                )
+
+        else:
+            # 1. Pure Dense Retrieval (E5 Semantic)
+            passages = self.lib.ask(clean_q, limit=k, doc_id=doc_id)
+            if not passages:
+                elapsed = (time.perf_counter() - t0) * 1000
+                return AnswerResult(
+                    question=clean_q,
+                    answer_text="У бібліотеці не знайдено матеріалів, пов'язаних із цим запитанням.",
+                    sources=[],
+                    retrieval_mode=retrieval_mode,
+                    latency_ms=elapsed,
+                    insufficient_info=True,
+                )
+
+            top_score = passages[0].score
+            if top_score < self.config.min_similarity:
+                elapsed = (time.perf_counter() - t0) * 1000
+                return AnswerResult(
+                    question=clean_q,
+                    answer_text=(
+                        "У знайдених фрагментах недостатньо релевантної інформації, "
+                        f"щоб надійно відповісти на це питання (максимальна схожість: {top_score:.3f} < {self.config.min_similarity:.2f})."
+                    ),
+                    sources=[],
+                    retrieval_mode=retrieval_mode,
+                    latency_ms=elapsed,
+                    confidence_score=top_score,
+                    insufficient_info=True,
+                )
+
+            for idx, p in enumerate(passages, 1):
+                clean_p_text = p.text.strip()
+                p_sha = compute_text_sha256(clean_p_text)
+                sources.append(
+                    AnswerSource(
+                        citation_index=idx,
+                        paragraph_id=p.paragraph_id,
+                        document_id=p.document_id,
+                        author=p.author,
+                        title=p.title,
+                        page=p.page,
+                        paragraph_index=p.paragraph_index,
+                        text=clean_p_text,
+                        score=p.score,
+                        text_sha256=p_sha,
+                    )
+                )
+
+            if self.config.shadow_rrf:
+                try:
+                    fts_candidates = self.lib._search_fts(clean_q, limit=max(k * 2, 10), doc_id=doc_id)
+                    rrf_items, ov5, ov10, top1_match = compute_simulated_rrf(
+                        fts_results=fts_candidates,
+                        semantic_results=passages,
+                        k=60,
+                        top_limit=k,
+                    )
+                    shadow_rrf_json = json.dumps({
+                        "overlap_at_5": ov5,
+                        "overlap_at_10": ov10,
+                        "top1_match": top1_match,
+                        "rrf_top_pids": [item["paragraph_id"] for item in rrf_items],
+                    })
+                except Exception as shadow_e:
+                    logger.warning(f"Shadow RRF evaluation failed: {shadow_e}")
 
         # 4. Dispatch to requested answering strategy
         if target_mode in ("gemini", "agy_gemini") or (target_mode == "auto" and self._is_agy_ready()):
-            res = self._generative_gemini_answer(clean_q, sources)
+            res = self._generative_gemini_answer(clean_q, sources, deep=deep_flag)
         elif target_mode == "generative" or (target_mode == "auto" and self._is_ollama_ready()):
             res = self._generative_llm_answer(clean_q, sources)
         else:
             res = self._extractive_answer(clean_q, sources)
 
+        cfg_sha = compute_config_sha(self.config, PROMPT_VERSION)
+        _, bundle_json, exp_sha = build_experiment_bundle(
+            clean_q, sources, PROMPT_VERSION, cfg_sha, retrieval_mode=retrieval_mode
+        )
+
         res.latency_ms = (time.perf_counter() - t0) * 1000
         res.confidence_score = top_score
+        res.retrieval_mode = retrieval_mode
+        res.shadow_rrf_json = shadow_rrf_json
+        res.book_count = len({s.document_id for s in sources if s.document_id})
+        res.author_count = len({s.author for s in sources if s.author})
+        res.prompt_version = PROMPT_VERSION
+        res.answer_config_sha = cfg_sha
+        res.source_text_hashes = [s.text_sha256 for s in res.sources]
+        res.experiment_input_sha = exp_sha
+        res.input_bundle_json = bundle_json
         return res
 
     def _extractive_answer(self, question: str, sources: List[AnswerSource]) -> AnswerResult:
@@ -389,14 +597,69 @@ class AnswerEngine:
         import shutil
         return shutil.which("agy") is not None
 
-    def _generative_gemini_answer(self, question: str, sources: List[AnswerSource]) -> AnswerResult:
+    def resolve_gemini_model(
+        self,
+        question: str,
+        sources: List[AnswerSource],
+        deep: bool = False,
+    ) -> Tuple[str, str, str]:
         """
-        Generative Answering via local Antigravity CLI (Gemini 3.8 Flash Low)
+        Determines the Gemini model, thinking tier, and trigger reason.
+        Returns: (model_id, tier, trigger)
+        Tiers:
+          - 'high': explicit --deep request (gemini-3.8-flash-high)
+          - 'medium': comparison or multi-source reasoning (gemini-3.8-flash-medium) when adaptive_thinking is ON
+          - 'low': fast default factual synthesis (gemini-3.8-flash-low)
+        """
+        if deep:
+            return "gemini-3.8-flash-high", "high", "explicit_deep"
+
+        if self.config.adaptive_thinking:
+            unique_docs = len({s.document_id for s in sources if s.document_id})
+            unique_authors = len({s.author for s in sources if s.author})
+
+            comparison_patterns = [
+                r"\bпорівняй",
+                r"\bпорівняння",
+                r"\bрізниц[яіею]",
+                r"\bвідмінност",
+                r"\bпротистав",
+                r"\bспіввідношен",
+                r"\bпротилежн",
+                r"\bвзаємозв",
+                r"\bяк пов'язан",
+                r"\bчи згоден\b",
+                r"\bсуперечност",
+            ]
+            is_comp = any(re.search(p, question, re.IGNORECASE) for p in comparison_patterns)
+
+            # Diversity-based escalation: strictly comparison or distinct authors/books
+            if is_comp:
+                return "gemini-3.8-flash-medium", "medium", "adaptive_comparison"
+            elif unique_authors >= 2:
+                return "gemini-3.8-flash-medium", "medium", "adaptive_multi_author"
+            elif unique_docs >= 2:
+                return "gemini-3.8-flash-medium", "medium", "adaptive_multi_book"
+
+        base_model = self.config.gemini_model or "gemini-3.8-flash-low"
+        return base_model, "low", "default"
+
+    def _generative_gemini_answer(
+        self,
+        question: str,
+        sources: List[AnswerSource],
+        deep: bool = False,
+    ) -> AnswerResult:
+        """
+        Generative Answering via local Antigravity CLI (Gemini 3.8 Flash)
         without requiring external API keys.
         Strict citation contract with automated Citation Verification Pass.
         Falls back to extractive mode if agy fails or citations are invalid.
         """
         import subprocess
+
+        # Resolve tier and model
+        model_id, tier, trigger = self.resolve_gemini_model(question, sources, deep=deep)
 
         # Prepare context blocks with clear citation markers
         context_blocks = []
@@ -422,9 +685,10 @@ class AnswerEngine:
         )
 
         fallback_reason = None
+        timeout_sec = 65 if tier == "high" else 45
         try:
-            cmd = ["agy", "--model", self.config.gemini_model, "-p", prompt]
-            res = subprocess.run(cmd, capture_output=True, timeout=35)
+            cmd = ["agy", "--model", model_id, "-p", prompt]
+            res = subprocess.run(cmd, capture_output=True, timeout=timeout_sec)
             if res.returncode == 0:
                 generated = res.stdout.decode("utf-8", errors="replace").strip()
                 if generated:
@@ -434,6 +698,9 @@ class AnswerEngine:
                             answer_text=generated,
                             sources=sources[:2],
                             mode="gemini",
+                            model_tier=tier,
+                            model_id=model_id,
+                            adaptive_trigger=trigger,
                             is_grounded=True,
                             insufficient_info=True,
                         )
@@ -447,6 +714,9 @@ class AnswerEngine:
                             answer_text=verified_text,
                             sources=used_sources,
                             mode="gemini",
+                            model_tier=tier,
+                            model_id=model_id,
+                            adaptive_trigger=trigger,
                             is_grounded=True,
                             unsupported_claims_count=unsupported_cnt,
                         )
@@ -463,6 +733,9 @@ class AnswerEngine:
 
         # Fallback to extractive
         res = self._extractive_answer(question, sources)
+        res.model_tier = tier
+        res.model_id = model_id
+        res.adaptive_trigger = trigger
         res.fallback_reason = fallback_reason or "Gemini fallback"
         res.error = fallback_reason
         return res

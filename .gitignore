@@ -30,3 +30,4 @@ temp_*/
 .vscode/
 .idea/
 *.swp
+latest_run.json
