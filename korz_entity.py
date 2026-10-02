@@ -103,6 +103,34 @@ def ensure_entity_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entity_scenes_pids ON entity_scenes(start_pid, end_pid);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entity_mentions_pid ON entity_mentions(paragraph_id);")
+
+    # Phase 4.3: Entity Candidates Table for Auto-Discovery Pipeline
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS entity_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id TEXT NOT NULL,
+        surface_form TEXT NOT NULL,
+        canonical_name TEXT NOT NULL,
+        frequency INTEGER NOT NULL,
+        mid_sentence_count INTEGER NOT NULL,
+        page_count INTEGER NOT NULL,
+        chapter_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_page INTEGER,
+        last_seen_page INTEGER,
+        action_score REAL NOT NULL DEFAULT 0.0,
+        prep_score REAL NOT NULL DEFAULT 0.0,
+        candidate_type TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        promoted_entity_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'candidate',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+        FOREIGN KEY (promoted_entity_id) REFERENCES entities(id) ON DELETE SET NULL,
+        UNIQUE(document_id, surface_form)
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entity_candidates_doc ON entity_candidates(document_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entity_candidates_status ON entity_candidates(status);")
     conn.commit()
 
 
@@ -268,6 +296,11 @@ def detect_character_intent(query: str) -> str:
         r"\bяке\s+було\b",
         r"\bким\s+був\b",
         r"\bким\s+була\b",
+        r"\bким\b.*?\bбул[а-я]*\b",
+        r"\bфах[а-я]*\b",
+        r"\bпрофесі[а-я]*\b",
+        r"\bспеціальност[а-я]*\b",
+        r"\bким\s+працював[а-я]*\b",
         r"\bхто\s+такий\b",
         r"\bхто\s+така\b",
         r"\bщо\s+за\s+персонаж\b",
@@ -493,7 +526,14 @@ def find_co_mentioned_terms(conn: sqlite3.Connection, query: str, exclude_entity
 
 
 def resolve_co_entity(conn: sqlite3.Connection, query: str, primary_entity_id: int) -> Optional[Dict[str, Any]]:
-    """Resolve a second entity from the query (excluding the primary one)."""
+    """Resolve a second entity from the query (excluding the primary one and its aliases)."""
+    primary_aliases = set(r[0].lower() for r in conn.execute(
+        "SELECT alias FROM entity_aliases WHERE entity_id = ?", (primary_entity_id,)
+    ).fetchall())
+    primary_cname = conn.execute("SELECT canonical_name FROM entities WHERE id = ?", (primary_entity_id,)).fetchone()
+    if primary_cname:
+        primary_aliases.add(primary_cname[0].lower())
+
     cur = conn.execute("""
         SELECT e.id, e.canonical_name, e.entity_type, e.book_id, a.alias
         FROM entities e
@@ -505,6 +545,8 @@ def resolve_co_entity(conn: sqlite3.Connection, query: str, primary_entity_id: i
     normalized_text = f" {query.lower()} "
     for eid, cname, etype, bid, alias in rows:
         alias_clean = alias.strip().lower()
+        if alias_clean in primary_aliases or cname.lower() in primary_aliases:
+            continue
         pattern = rf"(?:^|[^\wа-яА-ЯіїєґІЇЄҐ]){re.escape(alias_clean)}(?:$|[^\wа-яА-ЯіїєґІЇЄҐ])"
         if re.search(pattern, normalized_text, re.IGNORECASE):
             return {"id": eid, "canonical_name": cname, "entity_type": etype, "book_id": bid}
@@ -558,11 +600,12 @@ def _fetch_paragraphs_by_pids(conn: sqlite3.Connection, pids: List[int]) -> List
     return bundle_items
 
 
-def _gather_pids_from_scenes(scenes: List[Dict[str, Any]], max_paragraphs: int) -> List[int]:
+def _gather_pids_from_scenes(scenes: List[Dict[str, Any]], max_paragraphs: int, max_per_scene: Optional[int] = None) -> List[int]:
     """Gather contiguous PID runs from an ordered list of scenes, up to max_paragraphs."""
     gathered: List[int] = []
+    limit_per_scene = max_per_scene or max_paragraphs
     for sc in scenes:
-        pids = list(range(sc["start_pid"], sc["end_pid"] + 1))
+        pids = list(range(sc["start_pid"], sc["end_pid"] + 1))[:limit_per_scene]
         for pid in pids:
             if pid not in gathered:
                 gathered.append(pid)
@@ -592,11 +635,16 @@ def build_profile_bundle(
 ) -> List[Dict[str, Any]]:
     """
     Profile Bundle: Static portrait — personality, behavior, defining traits.
-    Prioritizes: personality_profile > dominance_bluff_resolution > alpha_reign > other
+    Prioritizes: personality_profile > dominance_bluff_resolution > alpha_reign > other.
+    Includes query focus keyword boost (career, profession, relationships, traits) and
+    samples across top scenes to prevent a single long scene from starving other key aspects.
     """
     dossier = get_entity_dossier(conn, entity_id)
     if not dossier or not dossier.get("scenes"):
         return []
+
+    focus_keywords = ["фах", "професі", "робот", "дисертац", "психолог", "освіт", "кар'єр", "дружин"]
+    q_lower = query.lower()
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
     for sc in dossier["scenes"]:
@@ -610,10 +658,22 @@ def build_profile_bundle(
             score += 15.0
         elif stype == "social_interaction":
             score += 10.0
+
+        # Query focus keyword boost
+        scene_text_row = conn.execute(
+            "SELECT GROUP_CONCAT(display_text, ' ') FROM paragraphs WHERE id BETWEEN ? AND ?",
+            (sc["start_pid"], sc["end_pid"]),
+        ).fetchone()
+        scene_text = (scene_text_row[0] or "").lower()
+        for fk in focus_keywords:
+            if fk in scene_text and (fk in q_lower or any(term in q_lower for term in ["фах", "професі", "ким", "робот"])):
+                score += 25.0
+
         scored.append((score, sc))
 
     ordered = [sc for _, sc in sorted(scored, key=lambda x: x[0], reverse=True)]
-    pids = _gather_pids_from_scenes(ordered, max_paragraphs)
+    limit_per_scene = max(3, max_paragraphs // 3)
+    pids = _gather_pids_from_scenes(ordered, max_paragraphs, max_per_scene=limit_per_scene)
     return _fetch_paragraphs_by_pids(conn, pids)
 
 
@@ -950,7 +1010,7 @@ def infer_scene_type(texts: List[str]) -> str:
     combined = " ".join(texts).lower()
     if any(k in combined for k in ["пішов з життя", "пішла з життя", "помер", "померла", "загинув", "загинула", "смерт"]):
         return "historical_demise"
-    if any(k in combined for k in ["особистість", "характер", "був добрим", "була нервов", "тип а", "найзліш", "поведінк"]):
+    if any(k in combined for k in ["особистість", "характер", "був добрим", "була нервов", "тип а", "найзліш", "поведінк", "дисертац", "психолог", "професі", "освіт", "кар'єр", "фах"]):
         return "personality_profile"
     if any(k in combined for k in ["альфа", "правління", "вожак", "влада", "статус", "ієрархі"]):
         return "alpha_reign"
@@ -1131,5 +1191,361 @@ def seed_all_pilots(conn: sqlite3.Connection) -> Dict[str, int]:
         "Ruth": seed_pilot_ruth(conn),
         "Naomi": seed_pilot_naomi(conn),
         "Fresco": seed_pilot_fresco(conn),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Phase 4.3: Autonomous Entity Discovery & Promotion Pipeline
+# ═══════════════════════════════════════════════════════════════════
+
+GAZETTEER_PLACES: Set[str] = {
+    "найробі", "кенія", "кенії", "кенію", "кенією",
+    "африка", "африки", "африці", "африку", "африкою",
+    "танзанія", "танзанії", "танзанію", "танзанією",
+    "серенгеті", "масаї-мара", "уганда", "уганді", "уганд",
+    "судан", "судані", "нью-йорк", "бостон", "гарвард",
+    "стенфорд", "лондон", "париж", "америка", "сша", "європа",
+    "кіліманджаро", "амбоселі", "моші", "аруша", "мояле",
+    "руанда", "руанди", "руандою", "заїр", "конго", "сомалі",
+    "ефіопія", "джуби", "джубі", "кампалі", "кампали",
+    "йорк", "йорку", "йорка", "бруклін", "брукліні", "брукліна",
+    "шотландія", "шотландії", "юдея", "юдеї", "захід", "заходу", "заході",
+}
+
+CONCEPT_STOPWORDS: Set[str] = {
+    "розділ", "глава", "частина", "примітка", "автор", "книга", "стор",
+    "понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя",
+    "січень", "лютий", "березень", "квітень", "травень", "червень",
+    "липень", "серпень", "вересень", "жовтень", "листопад", "грудень",
+    "година", "хвилина", "секунда", "тиждень", "місяць", "року", "роки", "років",
+    "масаї", "масаїв", "масаями", "масаям",
+}
+
+DISCOURSE_MARKERS: Set[str] = {
+    "гаразд", "знаєте", "може", "можу", "хіба", "нічого", "старий",
+    "бувай", "слухай", "дивись", "правда", "добре", "буде", "нехай",
+    "кажуть", "видно", "здається", "малюк", "інше",
+}
+
+GENERAL_STOPWORDS: Set[str] = {
+    "я", "ми", "він", "вона", "вони", "воно", "ти", "ви", "це", "той", "та", "те", "ті",
+    "але", "і", "й", "також", "коли", "як", "якщо", "де", "куди", "звідки", "чому", "тому",
+    "так", "ні", "навіть", "лише", "тільки", "ще", "вже", "після", "перед", "під", "над",
+    "через", "для", "про", "до", "від", "із", "зі", "із-за", "що", "хто", "однак", "проте",
+    "наприклад", "зокрема", "хоча", "нарешті", "наостанок", "пізніше", "раптом", "тоді",
+    "одного", "раз", "інший", "інша", "інші", "кожний", "кожен", "кожна", "кожне",
+    "дуже", "більш", "менш", "багато", "мало", "тут", "там", "сюди", "туди", "зараз",
+    "тепер", "вранці", "ввечері", "вдень", "вночі", "сьогодні", "вчора", "завтра",
+    "спершу", "спочатку", "наприкінці", "згодом", "разом", "сам", "сама", "самі", "саме",
+}
+
+PAST_VERB_PATTERN = re.compile(
+    r"\b(сказав[а-я]*|подививс[а-я]*|пішов[а-я]*|пішл[а-я]*|зробив[а-я]*|напав[а-я]*|"
+    r"вирішив[а-я]*|вирушив[а-я]*|побачив[а-я]*|закричав[а-я]*|втік[а-я]*|помер[а-я]*|"
+    r"народивс[а-я]*|кинувс[а-я]*|взяв[а-я]*|був[а-я]*|була[а-я]*|жив[а-я]*|жил[а-я]*|"
+    r"відчув[а-я]*|знав[а-я]*|сидів[а-я]*|стояв[а-я]*|біг[а-я]*|повернувс[а-я]*)\b",
+    re.IGNORECASE
+)
+
+PREPOSITION_PATTERN = re.compile(r"\b(у|в|до|з|зі|із|біля|навколо|поблизу)\s+$", re.IGNORECASE)
+
+UKR_CASE_SUFFIXES = [
+    "ові", "еві", "ою", "ею", "єю", "ям", "ем", "ом",
+    "ів", "ях", "ах", "их", "ами", "ями", "а", "я",
+    "у", "ю", "і", "и", "е", "ї"
+]
+
+
+def extract_stem(word: str) -> str:
+    """Strip Ukrainian noun declension suffixes down to canonical stem."""
+    w = word.strip()
+    for suffix in UKR_CASE_SUFFIXES:
+        if w.lower().endswith(suffix) and len(w) - len(suffix) >= 3:
+            return w[:-len(suffix)]
+    return w
+
+
+def mine_entity_candidates(conn: sqlite3.Connection, document_id: str) -> List[Dict[str, Any]]:
+    """
+    Phase 4.3.1: Candidate Mining.
+    Scans corpus paragraphs for recurring capitalized entities, computes occurrence statistics,
+    groups morphological declensions into canonical clusters, classifies types, and stores in SQLite.
+    """
+    ensure_entity_schema(conn)
+
+    rows = conn.execute(
+        "SELECT id, page_number, display_text FROM paragraphs WHERE document_id = ? ORDER BY id",
+        (document_id,)
+    ).fetchall()
+
+    if not rows:
+        return []
+
+    # Map paragraph IDs to chapter indices based on ## headings
+    current_chapter = 1
+    pid_to_chapter = {}
+    for pid, pg, text in rows:
+        if text.strip().startswith("##"):
+            current_chapter += 1
+        pid_to_chapter[pid] = current_chapter
+
+    from collections import defaultdict
+    word_stats = defaultdict(lambda: {
+        "total": 0,
+        "mid_sentence": 0,
+        "pages": set(),
+        "pids": set(),
+        "chapters": set(),
+        "actions": 0,
+        "prep_preceded": 0,
+    })
+
+    for pid, pg, text in rows:
+        ch = pid_to_chapter[pid]
+        for m in re.finditer(r"(?<!\w)([А-ЯІЇЄҐA-Z][а-яіїєґa-z\u02bc\u2019\x27-]+)(?!\w)", text):
+            w = m.group(1)
+            start = m.start()
+            end = m.end()
+
+            w_lower = w.lower()
+            if w_lower in GENERAL_STOPWORDS or w_lower in CONCEPT_STOPWORDS or w_lower in DISCOURSE_MARKERS or len(w) < 3:
+                continue
+
+            preceding_str = text[:start]
+            is_sentence_start = (start == 0) or bool(re.search(r"[.!?\n]\s*$", preceding_str))
+            has_prep = bool(PREPOSITION_PATTERN.search(preceding_str))
+
+            following_str = text[end:end+30]
+            has_action = bool(PAST_VERB_PATTERN.match(following_str.strip()))
+
+            st = word_stats[w]
+            st["total"] += 1
+            if not is_sentence_start:
+                st["mid_sentence"] += 1
+            if has_prep:
+                st["prep_preceded"] += 1
+            if has_action:
+                st["actions"] += 1
+            st["pages"].add(pg)
+            st["pids"].add(pid)
+            st["chapters"].add(ch)
+
+    # Group inflected forms into canonical entity clusters by stem
+    stem_clusters = defaultdict(list)
+    for w in word_stats.keys():
+        s = extract_stem(w)
+        stem_clusters[s.lower()].append(w)
+
+    candidates = []
+    now_str = datetime.datetime.utcnow().isoformat()
+
+    for stem_lower, forms in stem_clusters.items():
+        total_freq = sum(word_stats[f]["total"] for f in forms)
+        total_mid = sum(word_stats[f]["mid_sentence"] for f in forms)
+        all_pages = set().union(*(word_stats[f]["pages"] for f in forms))
+        all_chapters = set().union(*(word_stats[f]["chapters"] for f in forms))
+        total_actions = sum(word_stats[f]["actions"] for f in forms)
+        total_preps = sum(word_stats[f]["prep_preceded"] for f in forms)
+
+        canonical_surface = max(forms, key=lambda f: (word_stats[f]["total"], -len(f)))
+
+        action_score = total_actions / max(1, total_freq)
+        prep_score = total_preps / max(1, total_freq)
+
+        # Phase 4.3.2: Type Classification
+        is_known_place = any(f.lower() in GAZETTEER_PLACES for f in forms)
+        if is_known_place or (prep_score > 0.4 and action_score < 0.05):
+            candidate_type = "place"
+        elif any(f.lower() in CONCEPT_STOPWORDS for f in forms) or any(f.lower() in DISCOURSE_MARKERS for f in forms):
+            candidate_type = "concept"
+        else:
+            candidate_type = "person"
+
+        mid_ratio = total_mid / max(1, total_freq)
+        confidence = round(0.5 * mid_ratio + 0.3 * min(1.0, len(all_pages) / 5) + 0.2 * min(1.0, action_score * 3), 3)
+
+        cand_data = {
+            "document_id": document_id,
+            "surface_form": canonical_surface,
+            "canonical_stem": stem_lower,
+            "forms": sorted(forms, key=lambda f: word_stats[f]["total"], reverse=True),
+            "frequency": total_freq,
+            "mid_sentence_count": total_mid,
+            "page_count": len(all_pages),
+            "chapter_count": len(all_chapters),
+            "first_seen_page": min(all_pages) if all_pages else 0,
+            "last_seen_page": max(all_pages) if all_pages else 0,
+            "action_score": round(action_score, 3),
+            "prep_score": round(prep_score, 3),
+            "candidate_type": candidate_type,
+            "confidence": confidence,
+            "status": "candidate",
+            "created_at": now_str,
+        }
+        candidates.append(cand_data)
+
+        # Store in entity_candidates table
+        conn.execute("""
+        INSERT INTO entity_candidates (
+            document_id, surface_form, canonical_name, frequency, mid_sentence_count,
+            page_count, chapter_count, first_seen_page, last_seen_page, action_score,
+            prep_score, candidate_type, confidence, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id, surface_form) DO UPDATE SET
+            canonical_name = excluded.canonical_name,
+            frequency = excluded.frequency,
+            mid_sentence_count = excluded.mid_sentence_count,
+            page_count = excluded.page_count,
+            chapter_count = excluded.chapter_count,
+            first_seen_page = excluded.first_seen_page,
+            last_seen_page = excluded.last_seen_page,
+            action_score = excluded.action_score,
+            prep_score = excluded.prep_score,
+            candidate_type = excluded.candidate_type,
+            confidence = excluded.confidence,
+            created_at = excluded.created_at;
+        """, (
+            document_id, canonical_surface, canonical_surface, total_freq, total_mid,
+            len(all_pages), len(all_chapters), cand_data["first_seen_page"], cand_data["last_seen_page"],
+            cand_data["action_score"], cand_data["prep_score"], candidate_type, confidence,
+            "candidate", now_str,
+        ))
+
+    conn.commit()
+    return candidates
+
+
+def promote_entity_candidates(
+    conn: sqlite3.Connection,
+    document_id: str,
+    min_frequency: int = 5,
+    min_pages: int = 3,
+    min_chapters: int = 2,
+    min_confidence: float = 0.50,
+) -> List[Dict[str, Any]]:
+    """
+    Phase 4.3.3: Promotion Gate & Phase 4.3.4: Automatic Dossier Construction.
+    Evaluates mined candidates against strict promotion criteria:
+      - candidate_type in ('person', 'animal')
+      - frequency >= min_frequency
+      - page_count >= min_pages
+      - chapter_count >= min_chapters
+      - mid_sentence_count >= 3
+      - confidence >= min_confidence
+    Promotes approved candidates into canonical `entities`, registers morphological aliases,
+    indexes primary corpus paragraph mentions, and clusters cohesive narrative scenes.
+    """
+    candidates = mine_entity_candidates(conn, document_id)
+    promoted_entities = []
+
+    rows = conn.execute(
+        "SELECT id, display_text FROM paragraphs WHERE document_id = ? ORDER BY id",
+        (document_id,)
+    ).fetchall()
+
+    for cand in candidates:
+        is_qualified = (
+            cand["candidate_type"] in ("person", "animal")
+            and cand["frequency"] >= min_frequency
+            and cand["page_count"] >= min_pages
+            and cand["chapter_count"] >= min_chapters
+            and cand["mid_sentence_count"] >= 3
+            and cand["confidence"] >= min_confidence
+        )
+
+        if not is_qualified:
+            conn.execute(
+                "UPDATE entity_candidates SET status = 'rejected' WHERE document_id = ? AND surface_form = ?",
+                (document_id, cand["surface_form"])
+            )
+            continue
+
+        cname = cand["surface_form"]
+        forms = cand["forms"]
+
+        # Check if entity already exists
+        existing = conn.execute(
+            "SELECT id FROM entities WHERE canonical_name = ? AND book_id = ?",
+            (cname, document_id)
+        ).fetchone()
+
+        if existing:
+            eid = existing[0]
+        else:
+            eid = register_entity(
+                conn,
+                canonical_name=cname,
+                entity_type=cand["candidate_type"],
+                book_id=document_id,
+                aliases=forms,
+            )
+
+        # Register auto-discovered aliases
+        for f in forms:
+            register_alias(conn, entity_id=eid, alias=f, language="uk", alias_type="auto_discovered")
+
+        # Scan document paragraphs for mentions
+        pattern_str = r"(?:^|[^\wа-яА-ЯіїєґІЇЄҐ])(?:" + "|".join(re.escape(f) for f in forms) + r")(?:$|[^\wа-яА-ЯіїєґІЇЄҐ])"
+        regex = re.compile(pattern_str, re.IGNORECASE)
+
+        for pid, ptext in rows:
+            if regex.search(ptext):
+                register_mention(conn, entity_id=eid, paragraph_id=pid, mention_type="explicit_name")
+
+        # Auto-cluster contiguous narrative scenes
+        auto_cluster_and_register_scenes(conn, entity_id=eid, canonical_name=cname)
+
+        # Mark candidate as approved
+        conn.execute(
+            "UPDATE entity_candidates SET status = 'approved', promoted_entity_id = ? WHERE document_id = ? AND surface_form = ?",
+            (eid, document_id, cname)
+        )
+
+        cand["status"] = "approved"
+        cand["promoted_entity_id"] = eid
+        promoted_entities.append(cand)
+
+    conn.commit()
+    logger.info(f"Promoted {len(promoted_entities)} entities for document {document_id}")
+    return promoted_entities
+
+
+def auto_discover_entities_for_document(
+    conn: sqlite3.Connection,
+    document_id: str,
+    min_frequency: int = 5,
+    min_pages: int = 3,
+    min_chapters: int = 2,
+    min_confidence: float = 0.50,
+) -> Dict[str, Any]:
+    """
+    High-level entry point for Autonomous Entity Discovery on any document.
+    Executes:
+      1. Candidate Mining
+      2. Type Classification & Filtering
+      3. Promotion Gate
+      4. Scene Clustering & Dossier Generation
+    Returns audit summary.
+    """
+    promoted = promote_entity_candidates(
+        conn,
+        document_id=document_id,
+        min_frequency=min_frequency,
+        min_pages=min_pages,
+        min_chapters=min_chapters,
+        min_confidence=min_confidence,
+    )
+    total_cand = conn.execute(
+        "SELECT count(*) FROM entity_candidates WHERE document_id = ?", (document_id,)
+    ).fetchone()[0]
+    approved_count = len(promoted)
+    rejected_count = total_cand - approved_count
+
+    return {
+        "document_id": document_id,
+        "total_candidates": total_cand,
+        "approved_count": approved_count,
+        "rejected_count": rejected_count,
+        "promoted_entities": [p["surface_form"] for p in promoted],
     }
 

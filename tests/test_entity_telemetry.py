@@ -130,7 +130,7 @@ def test_entity_trace_end_to_end():
 
     telemetry = json.loads(res.entity_telemetry_json)
     assert telemetry["primary_entity"] == "Solomon"
-    assert "Урією" in telemetry["co_entities"] or "Uriah" in telemetry["co_entities"]
+    assert "Урією" in telemetry["co_entities"] or "Uriah" in telemetry["co_entities"] or "Урія" in telemetry["co_entities"]
     assert telemetry["bundle_builder"] == "build_relationship_bundle"
     assert telemetry["entity_resolution"]["matched_alias"] == "Соломоном"
     assert telemetry["entity_resolution"]["alias_type"] == "generated_morphology"
