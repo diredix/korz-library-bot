@@ -31,3 +31,15 @@ temp_*/
 .idea/
 *.swp
 latest_run.json
+/provider_settings.json
+/provider_settings.json.*
+/.provider_settings-*.tmp
+/.korz_runtime/
+
+# Book corpora folders
+Alfred_Korzybski_Science_and_Sanity_1948_UA/
+Jacque_Fresco_Future_Design_2007_Pages_1-79/
+Jacque_Fresco_Looking_Forward_Pages_1-121/
+Jacque_Fresco_The_Best_That_Money_Cant_Buy_2002_Pages_180/
+Robert_Sapolsky_A_Primates_Memoir_2002_Pages_1-308/
+Semia/
